@@ -56,6 +56,29 @@
 #define BATS_LINE_MAX_T 4096
 #define BATS_MAX_FLOWS 8
 
+/* --copy：仍按 generation/batch 走同一条四跳，三步都改成 memcpy。
+   再加 --add1 时，encode 每个载荷字节加 1，中继仍拷贝，decode 减 1。 */
+static int line_copy;
+static int line_add1;
+
+static void payload_add1(uint8_t *p, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        p[i] = (uint8_t)(p[i] + 1u);
+    }
+}
+
+static void payload_sub1(uint8_t *p, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        p[i] = (uint8_t)(p[i] - 1u);
+    }
+}
+
 typedef struct {
     int fd;
     struct sockaddr_in next;
@@ -63,6 +86,10 @@ typedef struct {
     uint64_t loss_state;
     int rate_mbps;
     uint64_t pace_next_ns;
+    uint64_t pace_intent_ns;
+    uint64_t pace_actual_ns;
+    uint64_t pace_sleeps;
+    uint64_t pace_skips;
     uint64_t sent;
     uint64_t dropped;
     uint64_t wire_bytes;
@@ -234,11 +261,20 @@ static void pace(Tx *tx, size_t nbytes)
     tx->pace_next_ns += (uint64_t)nbytes * 8000ull / (uint64_t)tx->rate_mbps;
     /* 领先不到 1ms 先攒着。按绝对时间睡，避免短 nanosleep 在虚拟机里被拉长。 */
     if (tx->pace_next_ns <= now + 1000000ull) {
+        tx->pace_skips++;
         return;
     }
     ts.tv_sec = (time_t)(tx->pace_next_ns / 1000000000ull);
     ts.tv_nsec = (long)(tx->pace_next_ns % 1000000000ull);
-    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+    {
+        uint64_t t0 = mono_ns();
+        uint64_t lead = tx->pace_next_ns > t0 ? tx->pace_next_ns - t0 : 0;
+
+        tx->pace_intent_ns += lead;
+        tx->pace_sleeps++;
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+        }
+        tx->pace_actual_ns += mono_ns() - t0;
     }
 }
 
@@ -401,56 +437,46 @@ static int send_coded(Tx *tx, uint16_t flow_id, uint32_t gen, uint32_t batch, un
                       uint32_t file_size, uint32_t k_pkts, uint32_t n_batches, uint32_t n_gens)
 {
     struct mmsghdr msgs[BATS_M];
-    struct iovec iov[BATS_M];
+    struct iovec iov[BATS_M * 2];
+    uint8_t hdr[BATS_M][BATS_LINE_HDR];
     int nmsg = 0;
     int j;
     int sent;
     size_t stride;
-    size_t need;
     size_t bytes = 0;
 
     if (n_pkts < 1 || n_pkts > BATS_M || T < 1 || T > BATS_LINE_MAX_T) {
         return -1;
     }
     stride = (size_t)BATS_LINE_HDR + T;
-    need = stride * (size_t)n_pkts;
-    if (tx->pkt_cap < need) {
-        uint8_t *np = realloc(tx->pkt, need);
-        if (np == NULL) {
-            return -1;
-        }
-        tx->pkt = np;
-        tx->pkt_cap = need;
-    }
     memset(msgs, 0, sizeof(msgs));
     for (j = 0; j < n_pkts; j++) {
-        uint8_t *buf;
         if (drop_data(tx)) {
             tx->dropped++;
             continue;
         }
-        buf = tx->pkt + (size_t)nmsg * stride;
-        memset(buf, 0, BATS_LINE_HDR);
-        put_u32(buf + 0, BATS_LINE_MAGIC);
-        buf[4] = BATS_LINE_VERSION;
-        buf[5] = BATS_LINE_DATA;
-        put_u16(buf + 6, flow_id);
-        put_u32(buf + 8, gen);
-        put_u32(buf + 12, batch);
-        put_u16(buf + 16, (unsigned)j);
-        put_u16(buf + 18, T);
-        put_u32(buf + 20, file_size);
-        put_u32(buf + 24, k_pkts);
-        put_u32(buf + 28, n_batches);
-        put_u32(buf + 32, n_gens);
-        memcpy(buf + 36, coeff + (size_t)j * BATS_M, BATS_M);
-        memcpy(buf + BATS_LINE_HDR, payload + (size_t)j * T, T);
-        iov[nmsg].iov_base = buf;
-        iov[nmsg].iov_len = stride;
+        memset(hdr[nmsg], 0, BATS_LINE_HDR);
+        put_u32(hdr[nmsg] + 0, BATS_LINE_MAGIC);
+        hdr[nmsg][4] = BATS_LINE_VERSION;
+        hdr[nmsg][5] = BATS_LINE_DATA;
+        put_u16(hdr[nmsg] + 6, flow_id);
+        put_u32(hdr[nmsg] + 8, gen);
+        put_u32(hdr[nmsg] + 12, batch);
+        put_u16(hdr[nmsg] + 16, (unsigned)j);
+        put_u16(hdr[nmsg] + 18, T);
+        put_u32(hdr[nmsg] + 20, file_size);
+        put_u32(hdr[nmsg] + 24, k_pkts);
+        put_u32(hdr[nmsg] + 28, n_batches);
+        put_u32(hdr[nmsg] + 32, n_gens);
+        memcpy(hdr[nmsg] + 36, coeff + (size_t)j * BATS_M, BATS_M);
+        iov[nmsg * 2].iov_base = hdr[nmsg];
+        iov[nmsg * 2].iov_len = BATS_LINE_HDR;
+        iov[nmsg * 2 + 1].iov_base = (void *)(payload + (size_t)j * T);
+        iov[nmsg * 2 + 1].iov_len = T;
         msgs[nmsg].msg_hdr.msg_name = &tx->next;
         msgs[nmsg].msg_hdr.msg_namelen = sizeof(tx->next);
-        msgs[nmsg].msg_hdr.msg_iov = &iov[nmsg];
-        msgs[nmsg].msg_hdr.msg_iovlen = 1;
+        msgs[nmsg].msg_hdr.msg_iov = &iov[nmsg * 2];
+        msgs[nmsg].msg_hdr.msg_iovlen = 2;
         bytes += stride;
         nmsg++;
     }
@@ -658,27 +684,17 @@ typedef struct {
     SrcSlot slot[SRC_WIN];
 } SrcPipe;
 
-static int src_encode_gen(SrcPipe *p, uint32_t gen, SrcSlot *slot)
+static int src_encode_gen(SrcPipe *p, uint32_t gen, SrcSlot *slot, uint8_t *block,
+                          uint8_t *payload)
 {
-    uint8_t *block;
     size_t off;
     size_t n;
-    uint8_t *payload;
     uint32_t batch;
     int unit_ok = 1;
 
-    block = malloc(p->coded_bytes == 0 ? 1 : p->coded_bytes);
-    payload = malloc((size_t)BATS_M * (size_t)(p->T > 0 ? p->T : 1));
-    if (block == NULL || payload == NULL) {
-        free(block);
-        free(payload);
-        return -1;
-    }
     off = (size_t)gen * p->gen_bytes;
     n = p->gen_bytes;
     if (off >= (size_t)p->file_size) {
-        free(block);
-        free(payload);
         return -1;
     }
     if (n > (size_t)p->file_size - off) {
@@ -686,14 +702,27 @@ static int src_encode_gen(SrcPipe *p, uint32_t gen, SrcSlot *slot)
     }
     memset(block, 0, p->coded_bytes);
     memcpy(block, p->file + off, n);
-    precode_apply(block, p->K, p->T, p->seed);
+    if (!line_copy) {
+        precode_apply(block, p->K, p->T, p->seed);
+    }
     for (batch = 0; batch < p->n_batches; batch++) {
         uint8_t coeff[BATS_M * BATS_M];
         int j;
 
-        if (bats_encode(block, p->coded_k, p->T, p->seed, batch, coeff, payload) != 0) {
-            free(payload);
-            free(block);
+        if (line_copy) {
+            memset(coeff, 0, sizeof(coeff));
+            for (j = 0; j < BATS_M; j++) {
+                unsigned pno = batch * (unsigned)BATS_M + (unsigned)j;
+                unsigned sym = pno < (unsigned)p->K ? pno : pno % (unsigned)p->K;
+
+                coeff[(size_t)j * BATS_M + (size_t)j] = 1;
+                memcpy(payload + (size_t)j * (size_t)p->T, block + (size_t)sym * (size_t)p->T,
+                       (size_t)p->T);
+                if (line_add1) {
+                    payload_add1(payload + (size_t)j * (size_t)p->T, (size_t)p->T);
+                }
+            }
+        } else if (bats_encode(block, p->coded_k, p->T, p->seed, batch, coeff, payload) != 0) {
             return -1;
         }
         for (j = 0; j < BATS_M; j++) {
@@ -720,15 +749,26 @@ static int src_encode_gen(SrcPipe *p, uint32_t gen, SrcSlot *slot)
         }
     }
     slot->unit_ok = unit_ok;
-    free(payload);
-    free(block);
     return 0;
 }
 
 static void *src_worker(void *arg)
 {
     SrcPipe *p = arg;
+    uint8_t *block;
+    uint8_t *payload;
 
+    block = malloc(p->coded_bytes == 0 ? 1 : p->coded_bytes);
+    payload = malloc((size_t)BATS_M * (size_t)(p->T > 0 ? p->T : 1));
+    if (block == NULL || payload == NULL) {
+        free(block);
+        free(payload);
+        pthread_mutex_lock(&p->mu);
+        p->failed = 1;
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+        return NULL;
+    }
     for (;;) {
         uint32_t gen;
         int si;
@@ -737,6 +777,8 @@ static void *src_worker(void *arg)
         pthread_mutex_lock(&p->mu);
         if (p->failed || p->next_claim >= p->n_gens) {
             pthread_mutex_unlock(&p->mu);
+            free(block);
+            free(payload);
             return NULL;
         }
         gen = p->next_claim++;
@@ -746,13 +788,15 @@ static void *src_worker(void *arg)
         }
         if (p->failed) {
             pthread_mutex_unlock(&p->mu);
+            free(block);
+            free(payload);
             return NULL;
         }
         p->slot[si].state = 1;
         p->slot[si].gen = gen;
         pthread_mutex_unlock(&p->mu);
 
-        rc = src_encode_gen(p, gen, &p->slot[si]);
+        rc = src_encode_gen(p, gen, &p->slot[si], block, payload);
 
         pthread_mutex_lock(&p->mu);
         if (rc != 0) {
@@ -764,6 +808,8 @@ static void *src_worker(void *arg)
         pthread_cond_broadcast(&p->cv);
         pthread_mutex_unlock(&p->mu);
         if (rc != 0) {
+            free(block);
+            free(payload);
             return NULL;
         }
     }
@@ -839,9 +885,9 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
     fprintf(stderr,
             "bats-line: role=source api=bats_encode M=%d K=%d precode=%d K_bats=%d T=%d "
             "gens=%u batches_per_gen=%u file_bytes=%ld seed=%" PRIu64 " flow=%u "
-            "g_on_wire=0 coeff_bytes=%d psi=line\n",
+            "g_on_wire=0 coeff_bytes=%d psi=line copy=%s\n",
             BATS_M, K, coded_k - K, coded_k, T, n_gens, n_batches, file_size, seed,
-            (unsigned)flow_id, BATS_M);
+            (unsigned)flow_id, BATS_M, line_add1 ? "add1" : (line_copy ? "copy" : "0"));
 
     memset(&pipe, 0, sizeof(pipe));
     pipe.file = file;
@@ -942,10 +988,15 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                 "bats-line: role=source unit_coeff_ok=1 data_packets=%" PRIu64
                 " loss_drops=%" PRIu64 " wire_bytes=%" PRIu64
                 " elapsed_ms=%" PRIu64 " achieved_mbps=%" PRIu64
-                " target_mbps=%d\n",
+                " target_mbps=%d pace_intent_us=%" PRIu64
+                " pace_actual_us=%" PRIu64 " pace_sleeps=%" PRIu64
+                " pace_skips=%" PRIu64 "\n",
                 data_packets, tx->dropped, tx->wire_bytes,
                 (uint64_t)(elapsed_ns / 1000000ull),
-                mbps_of(tx->wire_bytes, elapsed_ns), tx->rate_mbps);
+                mbps_of(tx->wire_bytes, elapsed_ns), tx->rate_mbps,
+                (uint64_t)(tx->pace_intent_ns / 1000u),
+                (uint64_t)(tx->pace_actual_ns / 1000u),
+                tx->pace_sleeps, tx->pace_skips);
     }
     return 0;
 }
@@ -1216,9 +1267,12 @@ static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *
     uint8_t coeff_out[BATS_M * BATS_M];
     uint8_t stack_in[BATS_M * 2048];
     uint8_t stack_out[BATS_M * 2048];
-    uint8_t *payload_in;
+    uint8_t *payload_in = NULL;
     uint8_t *payload_out;
-    int use_heap;
+    const uint8_t *coeff_src;
+    int heap_in = 0;
+    int heap_out = 0;
+    int direct;
     int n_in = 0;
     int n_out = 0;
     int j;
@@ -1231,49 +1285,92 @@ static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *
         return -1;
     }
 
-    use_heap = T > 2048u;
-    if (use_heap) {
-        payload_in = malloc((size_t)BATS_M * T);
+    direct = s->n == BATS_M;
+    if (direct) {
+        for (j = 0; j < BATS_M; j++) {
+            if (!s->seen[j]) {
+                direct = 0;
+                break;
+            }
+        }
+    }
+    if (T > 2048u) {
         payload_out = malloc((size_t)BATS_M * T);
-        if (payload_in == NULL || payload_out == NULL) {
+        heap_out = 1;
+        if (!direct) {
+            payload_in = malloc((size_t)BATS_M * T);
+            heap_in = 1;
+        }
+        if (payload_out == NULL || (heap_in && payload_in == NULL)) {
             free(payload_in);
             free(payload_out);
             return -1;
         }
     } else {
-        payload_in = stack_in;
         payload_out = stack_out;
-    }
-    for (j = 0; j < BATS_M; j++) {
-        if (!s->seen[j]) {
-            continue;
+        if (!direct) {
+            payload_in = stack_in;
         }
-        memcpy(coeff_in + (size_t)n_in * BATS_M, s->coeff + (size_t)j * BATS_M, BATS_M);
-        memcpy(payload_in + (size_t)n_in * T, s->payload + (size_t)j * T, T);
-        n_in++;
+    }
+    if (direct) {
+        coeff_src = s->coeff;
+        payload_in = s->payload;
+        n_in = BATS_M;
+    } else {
+        coeff_src = coeff_in;
+        for (j = 0; j < BATS_M; j++) {
+            if (!s->seen[j]) {
+                continue;
+            }
+            memcpy(coeff_in + (size_t)n_in * BATS_M, s->coeff + (size_t)j * BATS_M, BATS_M);
+            memcpy(payload_in + (size_t)n_in * T, s->payload + (size_t)j * T, T);
+            n_in++;
+        }
     }
     if (n_in <= 0) {
-        if (use_heap) {
+        if (heap_in) {
             free(payload_in);
+        }
+        if (heap_out) {
             free(payload_out);
         }
         slot_clear(s);
         return 0;
     }
     t0 = mono_ns();
-    rc = bats_recode(coeff_in, payload_in, n_in, (int)T, &f->recode_state, coeff_out, payload_out,
-                     &n_out);
+    if (line_copy) {
+        memset(coeff_out, 0, sizeof(coeff_out));
+        memset(payload_out, 0, (size_t)BATS_M * T);
+        n_in = 0;
+        for (j = 0; j < BATS_M; j++) {
+            if (!s->seen[j]) {
+                continue;
+            }
+            memcpy(coeff_out + (size_t)j * BATS_M, s->coeff + (size_t)j * BATS_M, BATS_M);
+            memcpy(payload_out + (size_t)j * T, s->payload + (size_t)j * T, T);
+            n_in++;
+        }
+        n_out = BATS_M;
+        rc = 0;
+    } else {
+        rc = bats_recode(coeff_src, payload_in, n_in, (int)T, &f->recode_state, coeff_out,
+                         payload_out, &n_out);
+    }
     if (rc != 0 || n_out != BATS_M) {
-        if (use_heap) {
+        if (heap_in) {
             free(payload_in);
+        }
+        if (heap_out) {
             free(payload_out);
         }
         return -1;
     }
     if (send_coded(tx, f->flow_id, s->gen_id, s->batch_id, T, coeff_out, payload_out, BATS_M,
                    f->file_size, f->k_pkts, f->n_batches, f->n_gens) < 0) {
-        if (use_heap) {
+        if (heap_in) {
             free(payload_in);
+        }
+        if (heap_out) {
             free(payload_out);
         }
         return -1;
@@ -1290,8 +1387,10 @@ static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *
     (*recoded)++;
     *data_out += (uint64_t)BATS_M;
     hist[n_in]++;
-    if (use_heap) {
+    if (heap_in) {
         free(payload_in);
+    }
+    if (heap_out) {
         free(payload_out);
     }
     if (mark_flushed(maps, nmaps, s->flow_id, s->gen_id, s->batch_id) != 0) {
@@ -2110,11 +2209,16 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
             " packets_out=%" PRIu64 " loss_drops=%" PRIu64
             " wire_bytes=%" PRIu64 " forward_ms=%" PRIu64
             " achieved_mbps=%" PRIu64
-            " recv_hist=%d,%d,%d,%d,%d,%d,%d,%d,%d socket_drops=%u\n",
+            " recv_hist=%d,%d,%d,%d,%d,%d,%d,%d,%d socket_drops=%u"
+            " pace_intent_us=%" PRIu64 " pace_actual_us=%" PRIu64
+            " pace_sleeps=%" PRIu64 " pace_skips=%" PRIu64 "\n",
             rx.n_flows, recoded, partial, empty, full, rx.data_pkts, data_out, tx->dropped,
             tx->wire_bytes, (uint64_t)(busy_ns / 1000000ull),
             mbps_of(tx->wire_bytes, busy_ns), hist[0], hist[1], hist[2], hist[3], hist[4],
-            hist[5], hist[6], hist[7], hist[8], socket_drops);
+            hist[5], hist[6], hist[7], hist[8], socket_drops,
+            (uint64_t)(tx->pace_intent_ns / 1000u),
+            (uint64_t)(tx->pace_actual_ns / 1000u),
+            tx->pace_sleeps, tx->pace_skips);
     rc = 0;
 out:
     if (started) {
@@ -2194,8 +2298,9 @@ static GenBuf *gen_find(DestPool *pool, uint16_t flow_id, uint32_t gen, int crea
     return g;
 }
 
-static int gen_add(GenBuf *g, uint32_t batch, unsigned index, int T, const uint8_t *coeff,
-                   const uint8_t *payload)
+/* 0 已在 g->n 留下空位，1 是重复包，-1 内存不足。载荷由调用者在放开锁之后写入。 */
+static int gen_reserve(GenBuf *g, uint32_t batch, unsigned index, int T, const uint8_t *coeff,
+                       size_t *slot)
 {
     size_t i;
     size_t ncap;
@@ -2206,7 +2311,7 @@ static int gen_add(GenBuf *g, uint32_t batch, unsigned index, int T, const uint8
 
     for (i = 0; i < g->n; i++) {
         if (g->batch_id[i] == batch && g->index[i] == (uint16_t)index) {
-            return 0;
+            return 1;
         }
     }
     if (g->n == g->cap) {
@@ -2235,9 +2340,7 @@ static int gen_add(GenBuf *g, uint32_t batch, unsigned index, int T, const uint8
     g->batch_id[g->n] = batch;
     g->index[g->n] = (uint16_t)index;
     memcpy(g->coeff + g->n * BATS_M, coeff, BATS_M);
-    memcpy(g->pay + g->n * (size_t)T, payload, (size_t)T);
-    g->n++;
-    g->last_ns = mono_ns();
+    *slot = g->n;
     return 0;
 }
 
@@ -2280,6 +2383,38 @@ static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32
     gen_bytes = (size_t)K * (size_t)T;
     coded_k = precode_k(K);
     coded_bytes = (size_t)coded_k * (size_t)T;
+    if (line_copy) {
+        dst = calloc(1, gen_bytes == 0 ? 1 : gen_bytes);
+        if (dst == NULL) {
+            fprintf(stderr, "bats-line: 内存不足\n");
+            return -1;
+        }
+        for (i = 0; i < g->n; i++) {
+            unsigned pno = g->batch_id[i] * (unsigned)BATS_M + g->index[i];
+
+            if (pno >= (unsigned)K) {
+                continue;
+            }
+            memcpy(dst + (size_t)pno * (size_t)T, g->pay + i * (size_t)T, (size_t)T);
+            if (line_add1) {
+                payload_sub1(dst + (size_t)pno * (size_t)T, (size_t)T);
+            }
+        }
+        off = (size_t)g->gen_id * gen_bytes;
+        chunk = gen_bytes;
+        if (off >= file_size) {
+            chunk = 0;
+        } else if (chunk > (size_t)file_size - off) {
+            chunk = (size_t)file_size - off;
+        }
+        if (chunk > 0 && pwrite_all(out_fd, dst, chunk, (off_t)off) != 0) {
+            free(dst);
+            fprintf(stderr, "bats-line: 写输出失败\n");
+            return -1;
+        }
+        free(dst);
+        return 0;
+    }
     syms = calloc(g->n == 0 ? 1 : g->n, sizeof(BatsSymbol));
     dst = calloc(1, coded_bytes == 0 ? 1 : coded_bytes);
     if (syms == NULL || dst == NULL) {
@@ -2669,11 +2804,27 @@ static int dest_on_packet(DestPool *pool, const uint8_t *buf, size_t n, int K, i
         flow->touched[gen] = 1;
     }
     g->last_ns = pool->last_rx_ns;
-    if (gen_add(g, get_u32(buf + 12), index, T, buf + 36, buf + BATS_LINE_HDR) != 0) {
-        die("内存不足");
-    }
-    if (flow->n_batches > 0 && g->n >= (size_t)flow->n_batches * (size_t)BATS_M) {
-        dest_queue(pool, g);
+    {
+        size_t slot = 0;
+        uint8_t *dst;
+        int reserved = gen_reserve(g, get_u32(buf + 12), index, T, buf + 36, &slot);
+
+        if (reserved < 0) {
+            die("内存不足");
+        }
+        if (reserved == 0) {
+            dst = g->pay + slot * (size_t)T;
+            pthread_mutex_unlock(&pool->mu);
+            *locked = 0;
+            memcpy(dst, buf + BATS_LINE_HDR, (size_t)T);
+            pthread_mutex_lock(&pool->mu);
+            *locked = 1;
+            g->n++;
+            g->last_ns = mono_ns();
+            if (flow->n_batches > 0 && g->n >= (size_t)flow->n_batches * (size_t)BATS_M) {
+                dest_queue(pool, g);
+            }
+        }
     }
     pthread_mutex_unlock(&pool->mu);
     *locked = 0;
@@ -2830,7 +2981,9 @@ static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int r
             if (dest_all_done(&pool)) {
                 rc = 0;
             } else if (due && !ended) {
-                fprintf(stderr, "bats-line: idle timeout before END\n");
+                fprintf(stderr,
+                        "bats-line: idle timeout before END data_pkts=%" PRIu64 " gens_done=%d\n",
+                        pool.n_flows > 0 ? pool.flows[0].data_pkts : 0, pool.n_done);
                 goto out;
             } else if (due && ended) {
                 int fi;
@@ -2970,7 +3123,9 @@ static void usage(void)
             "  --loss-seed N\n"
             "  --rate-mbps N        0 表示不限速\n"
             "  --reorder-ms N       保留参数，收发不再用它决定缺包\n"
-            "  --idle-sec N         空闲这么久仍缺包就 recode 或译码；一直等不到 END 也在这时失败\n");
+            "  --idle-sec N         空闲这么久仍缺包就 recode 或译码；一直等不到 END 也在这时失败\n"
+            "  --copy               不调用 encode/recode/decode，载荷按符号 memcpy\n"
+            "  --add1               和 --copy 一起用：encode 每字节加 1，decode 减 1，中继仍拷贝\n");
 }
 
 int main(int argc, char **argv)
@@ -3081,6 +3236,11 @@ int main(int argc, char **argv)
                 die("--flows 不合法");
             }
             i++;
+        } else if (strcmp(a, "--copy") == 0) {
+            line_copy = 1;
+        } else if (strcmp(a, "--add1") == 0) {
+            line_copy = 1;
+            line_add1 = 1;
         } else if (strcmp(a, "--help") == 0) {
             usage();
             return 0;

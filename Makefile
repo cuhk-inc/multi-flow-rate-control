@@ -192,7 +192,7 @@ wire-relay: $(RELAY_BIN)
 bats-line: $(BATS_LINE_BIN)
 
 $(BATS_LINE_BIN): $(BATS_LINE_SRCS) | $(OBJ_DIR)
-	$(CC) -std=c11 -Wall -Wextra -O2 -I$(BATS_DIR) -I../buffer-management-module/include -o $@ $(BATS_LINE_SRCS) ../buffer-management-module/src/circular_buffer.c -pthread -lm
+	$(CC) -std=c11 -Wall -Wextra -O3 -I$(BATS_DIR) -I../buffer-management-module/include -o $@ $(BATS_LINE_SRCS) ../buffer-management-module/src/circular_buffer.c -pthread -lm
 
 # TEST ONLY: Phase-0 HOL baseline (inline RX on the recv thread).
 wire-relay-hol-baseline: $(OBJ_DIR)/wire_relay_hol_baseline
