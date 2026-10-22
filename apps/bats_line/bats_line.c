@@ -22,6 +22,10 @@
  * 目的端收齐一个 generation 就译；缺包的 generation 也留到
  * 空闲达到 idle-sec 再译。一代的缓冲在第一个包到达时分配，译完释放。各代并行译。
  * 丢包只作用在 DATA 上，发生在 sendmmsg 之前。END 不丢。
+ *
+ * 度数：源和目的启动时若工作目录有 psi_network.txt 就装上它，否则用 psi_line.h。
+ * 目的端加 --fit-psi，这一轮仍用测量前的度数；跑完按目的端秩分布写出新的
+ * psi_network.txt。把该文件放到源的工作目录后再跑，两端才一起换上新度数。
  */
 
 #define _GNU_SOURCE
@@ -63,6 +67,16 @@
    再加 --add1 时，encode 每个载荷字节加 1，中继仍拷贝，decode 减 1。 */
 static int line_copy;
 static int line_add1;
+static int line_fit_psi;
+static const char *line_fit_path;
+static const char *line_psi_path;
+
+#define PSI_NETWORK_FILE "psi_network.txt"
+
+int psi_load(const char *path);
+int psi_optimize(const int *counts, int ncounts, int max_degree, double eta_bar, int samples,
+                 double q, int scale, int *weights_out, int weights_cap, int *D_out,
+                 const char *weights_path);
 
 static void payload_add1(uint8_t *p, size_t n)
 {
@@ -384,11 +398,35 @@ static int send_bytes(Tx *tx, const uint8_t *buf, size_t len, int is_data)
     return send_bytes_socket(tx, buf, len, is_data);
 }
 
-static void install_line_psi(void)
+static int file_exists(const char *path)
 {
+    FILE *f = fopen(path, "rb");
+
+    if (f == NULL) {
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+static void install_line_psi(const char *explicit_path)
+{
+    const char *path = explicit_path;
+
+    if (path == NULL && file_exists(PSI_NETWORK_FILE)) {
+        path = PSI_NETWORK_FILE;
+    }
+    if (path != NULL) {
+        if (!psi_load(path)) {
+            die("无法装入度数分布");
+        }
+        fprintf(stderr, "bats-line: 装入度数 %s\n", path);
+        return;
+    }
     if (!psi_set(psi_line_w, psi_line_D)) {
         die("无法装入优化后的度数分布");
     }
+    fprintf(stderr, "bats-line: 使用内置 psi_line.h\n");
 }
 
 /* η≈0.98：每 K 个源包补 ceil(K*0.02/0.98) 个校验包。校验包也进入后面的 batch。 */
@@ -1339,6 +1377,7 @@ typedef struct {
     int n_done;
     unsigned char *touched;
     unsigned char *finished;
+    unsigned char *ranked;
 } DestFlow;
 
 typedef struct {
@@ -1362,6 +1401,8 @@ typedef struct {
     uint64_t symbols;
     int bp_sum;
     int inact_sum;
+    int fit_psi;
+    int rank_hist[BATS_M + 1];
 } DestPool;
 
 static int flows_all_ended(const RxMeta *rx)
@@ -3008,8 +3049,55 @@ static int pwrite_all(int fd, const uint8_t *buf, size_t n, off_t off)
     return 0;
 }
 
+static void tally_gen_ranks(const GenBuf *g, uint32_t n_batches, int hist[BATS_M + 1])
+{
+    uint32_t b;
+
+    if (g == NULL || n_batches == 0) {
+        return;
+    }
+    for (b = 0; b < n_batches; b++) {
+        size_t i;
+        int n = 0;
+        int filled = 0;
+        int rank;
+        uint8_t *A;
+
+        for (i = 0; i < g->n; i++) {
+            if (g->batch_id[i] == b) {
+                n++;
+            }
+        }
+        if (n == 0) {
+            hist[0]++;
+            continue;
+        }
+        A = malloc((size_t)n * BATS_M);
+        if (A == NULL) {
+            die("内存不足");
+        }
+        for (i = 0; i < g->n; i++) {
+            if (g->batch_id[i] != b) {
+                continue;
+            }
+            memcpy(A + (size_t)filled * BATS_M, g->coeff + i * BATS_M, BATS_M);
+            filled++;
+        }
+        rank = coeff_rank_matrix(A, filled);
+        free(A);
+        if (rank < 0) {
+            rank = 0;
+        }
+        if (rank > BATS_M) {
+            rank = BATS_M;
+        }
+        hist[rank]++;
+    }
+}
+
 static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32_t file_size,
-                      uint64_t *dense, uint64_t *symbols, int *bp_sum, int *inact_sum)
+                      uint64_t *dense, uint64_t *symbols, int *bp_sum, int *inact_sum,
+                      int *rank_hist, uint32_t n_batches)
 {
     BatsSymbol *syms;
     uint8_t *dst;
@@ -3023,6 +3111,9 @@ static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32
     int inact = 0;
     int ok;
 
+    if (rank_hist != NULL) {
+        tally_gen_ranks(g, n_batches, rank_hist);
+    }
     gen_bytes = (size_t)K * (size_t)T;
     coded_k = precode_k(K);
     coded_bytes = (size_t)coded_k * (size_t)T;
@@ -3119,6 +3210,9 @@ static void *dest_worker(void *arg)
         uint64_t seed;
         uint64_t dense = 0;
         uint64_t symbols = 0;
+        uint32_t n_batches = 0;
+        int fitting;
+        int local_hist[BATS_M + 1];
         int bp = 0;
         int inact = 0;
         int rc;
@@ -3148,11 +3242,29 @@ static void *dest_worker(void *arg)
         file_size = flow != NULL ? flow->file_size : 0;
         seed = pool->seed;
         gen_id = g->gen_id;
+        fitting = pool->fit_psi;
+        if (flow != NULL) {
+            n_batches = flow->n_batches;
+        }
         pthread_mutex_unlock(&pool->mu);
 
-        rc = decode_gen(g, K, T, seed, fd, file_size, &dense, &symbols, &bp, &inact);
+        if (fitting) {
+            memset(local_hist, 0, sizeof(local_hist));
+        }
+        rc = decode_gen(g, K, T, seed, fd, file_size, &dense, &symbols, &bp, &inact,
+                        fitting ? local_hist : NULL, n_batches);
 
         pthread_mutex_lock(&pool->mu);
+        if (fitting) {
+            int r;
+
+            for (r = 0; r <= BATS_M; r++) {
+                pool->rank_hist[r] += local_hist[r];
+            }
+            if (flow != NULL && flow->ranked != NULL && gen_id < flow->n_gens) {
+                flow->ranked[gen_id] = 1;
+            }
+        }
         if (rc != 0) {
             pool->failed = 1;
         } else {
@@ -3265,7 +3377,8 @@ static void dest_bind_meta(DestFlow *f, const uint8_t *buf)
     }
     f->touched = calloc(f->n_gens, 1);
     f->finished = calloc(f->n_gens, 1);
-    if (f->touched == NULL || f->finished == NULL) {
+    f->ranked = calloc(f->n_gens, 1);
+    if (f->touched == NULL || f->finished == NULL || f->ranked == NULL) {
         die("内存不足");
     }
 }
@@ -3486,6 +3599,80 @@ static int dest_on_packet(DestPool *pool, const uint8_t *buf, size_t n, int K, i
     return 0;
 }
 
+static int fit_write(DestPool *pool, int K)
+{
+    const char *path = line_fit_path != NULL ? line_fit_path : PSI_NETWORK_FILE;
+    GenBuf *g;
+    int fi;
+    int r;
+    int cap;
+    long long total = 0;
+
+    for (g = pool->gens; g != NULL; g = g->next) {
+        DestFlow *flow = NULL;
+        uint32_t nb = 0;
+
+        if (!g->used) {
+            continue;
+        }
+        if (g->flow_i >= 0 && g->flow_i < pool->n_flows) {
+            flow = &pool->flows[g->flow_i];
+            nb = flow->n_batches;
+        }
+        tally_gen_ranks(g, nb, pool->rank_hist);
+        if (flow != NULL && flow->ranked != NULL && g->gen_id < flow->n_gens) {
+            flow->ranked[g->gen_id] = 1;
+        }
+    }
+    for (fi = 0; fi < pool->n_flows; fi++) {
+        DestFlow *flow = &pool->flows[fi];
+        uint32_t gen;
+
+        if (!flow->used || !flow->end_seen || flow->ranked == NULL) {
+            continue;
+        }
+        for (gen = 0; gen < flow->n_gens; gen++) {
+            if (!flow->ranked[gen]) {
+                pool->rank_hist[0] += (int)flow->n_batches;
+            }
+        }
+    }
+    fprintf(stderr, "bats-line: 目的端秩个数（秩 0 到 %d）:", BATS_M);
+    for (r = 0; r <= BATS_M; r++) {
+        fprintf(stderr, " %d", pool->rank_hist[r]);
+        total += pool->rank_hist[r];
+    }
+    fprintf(stderr, "\n");
+    if (total <= 0) {
+        fprintf(stderr, "bats-line: 没有测到 batch，未写度数\n");
+        return -1;
+    }
+    cap = precode_k(K);
+    if (cap > 128) {
+        cap = 128;
+    }
+    if (cap < 1) {
+        cap = 1;
+    }
+    if (!psi_optimize(pool->rank_hist, BATS_M + 1, cap, 0.98, 100, 256.0, 1000000, NULL, 0, NULL,
+                      path)) {
+        fprintf(stderr, "bats-line: 度数优化失败\n");
+        return -1;
+    }
+    if (strcmp(path, PSI_NETWORK_FILE) == 0) {
+        fprintf(stderr,
+                "bats-line: 度数已写入 %s。把这个文件放到源的工作目录后再跑下一轮；"
+                "源和目的都会自动装上它。这一轮用的仍是测量前的度数。\n",
+                path);
+    } else {
+        fprintf(stderr,
+                "bats-line: 度数已写入 %s。下一轮源和目的都加上 --psi %s。"
+                "这一轮用的仍是测量前的度数。\n",
+                path, path);
+    }
+    return 0;
+}
+
 static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int reorder_ms,
                     int idle_sec, int expect_flows, int worker_arg)
 {
@@ -3506,6 +3693,7 @@ static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int r
 
     (void)reorder_ms;
     memset(&pool, 0, sizeof(pool));
+    pool.fit_psi = line_fit_psi;
     memset(&q, 0, sizeof(q));
     q.core = -1;
     pool.last_rx_ns = mono_ns();
@@ -3724,6 +3912,9 @@ out:
         rc = 1;
     }
     pthread_mutex_unlock(&pool.mu);
+    if (pool.fit_psi && fit_write(&pool, pool.K) != 0) {
+        rc = 1;
+    }
     if (pool.spare_fd >= 0) {
         close(pool.spare_fd);
     }
@@ -3733,6 +3924,7 @@ out:
         }
         free(pool.flows[i].touched);
         free(pool.flows[i].finished);
+        free(pool.flows[i].ranked);
     }
     while (pool.gens != NULL) {
         GenBuf *g = pool.gens;
@@ -3786,7 +3978,9 @@ static void usage(void)
             "  --reorder-ms N       保留参数，收发不再用它决定缺包\n"
             "  --idle-sec N         空闲这么久仍缺包就 recode 或译码；一直等不到 END 也在这时失败\n"
             "  --copy               不调用 encode/recode/decode，载荷按符号 memcpy\n"
-            "  --add1               和 --copy 一起用：encode 每字节加 1，decode 减 1，中继仍拷贝\n");
+            "  --add1               和 --copy 一起用：encode 每字节加 1，decode 减 1，中继仍拷贝\n"
+            "  --psi PATH           源和目的装入这份度数；不给则有 psi_network.txt 就用它，否则用 psi_line.h\n"
+            "  --fit-psi [PATH]     只在目的端：按本轮目的端秩分布写出度数，默认 psi_network.txt\n");
 }
 
 int main(int argc, char **argv)
@@ -3903,6 +4097,15 @@ int main(int argc, char **argv)
                 die("--workers 不合法");
             }
             i++;
+        } else if (strcmp(a, "--psi") == 0 && val) {
+            line_psi_path = val;
+            i++;
+        } else if (strcmp(a, "--fit-psi") == 0) {
+            line_fit_psi = 1;
+            if (val != NULL && val[0] != '-') {
+                line_fit_path = val;
+                i++;
+            }
         } else if (strcmp(a, "--copy") == 0) {
             line_copy = 1;
         } else if (strcmp(a, "--add1") == 0) {
@@ -3920,10 +4123,21 @@ int main(int argc, char **argv)
         usage();
         return 1;
     }
+    if (line_fit_psi && strcmp(role, "dest") != 0) {
+        die("--fit-psi 只在目的端使用");
+    }
+    if (line_fit_psi && line_copy) {
+        die("--fit-psi 不能和 --copy 一起用");
+    }
+    if (line_psi_path != NULL && strcmp(role, "relay") == 0) {
+        die("--psi 只给源和目的");
+    }
 
     setvbuf(stderr, NULL, _IOLBF, 0);
     bats_init();
-    install_line_psi();
+    if (strcmp(role, "source") == 0 || strcmp(role, "dest") == 0) {
+        install_line_psi(line_psi_path);
+    }
     memset(&tx, 0, sizeof(tx));
     tx.loss_percent = (int)loss_percent;
     tx.loss_state = loss_seed ? loss_seed : 1;

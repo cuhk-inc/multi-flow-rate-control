@@ -177,6 +177,7 @@ BATS_LINE_SRCS = \
 	$(BATS_DIR)/source.c \
 	$(BATS_DIR)/dest.c \
 	$(BATS_DIR)/codec.c \
+	$(BATS_DIR)/psi_opt.c \
 	$(BATS_DIR)/sim.c \
 	$(BATS_DIR)/link.c \
 	$(BATS_DIR)/relay.c
