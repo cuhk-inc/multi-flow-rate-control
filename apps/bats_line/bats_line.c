@@ -108,6 +108,7 @@ typedef struct {
     uint64_t pace_actual_ns;
     uint64_t pace_sleeps;
     uint64_t pace_skips;
+    uint64_t pace_burst;
     uint64_t sent;
     uint64_t dropped;
     uint64_t wire_bytes;
@@ -286,11 +287,34 @@ static int drop_data(Tx *tx)
     return (int)(tx->loss_state % 100ull) < tx->loss_percent;
 }
 
-static void pace(Tx *tx, size_t nbytes)
+/* 领先达到 2ms 用绝对时间睡眠。不到 2ms 不能 nanosleep，虚拟机会把短睡眠拉长，
+   所以空转到点。调用前 due > now。睡完后这一串从当前这次的字节重新计。 */
+static void pace_wait(Tx *tx, uint64_t due, uint64_t now, size_t nbytes)
 {
     struct timespec ts;
+    uint64_t t0 = now;
+    uint64_t lead = due - now;
+
+    tx->pace_intent_ns += lead;
+    tx->pace_sleeps++;
+    if (lead >= 2000000ull) {
+        ts.tv_sec = (time_t)(due / 1000000000ull);
+        ts.tv_nsec = (long)(due % 1000000000ull);
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+        }
+    } else {
+        while (mono_ns() < due) {
+        }
+    }
+    tx->pace_actual_ns += mono_ns() - t0;
+    tx->pace_burst = nbytes;
+}
+
+static void pace(Tx *tx, size_t nbytes)
+{
     uint64_t now;
     uint64_t due;
+    uint64_t cap;
 
     if (tx->rate_mbps <= 0 || nbytes == 0) {
         return;
@@ -300,24 +324,24 @@ static void pace(Tx *tx, size_t nbytes)
         tx->pace_origin_ns = now;
     }
     tx->pace_bytes += nbytes;
+    tx->pace_burst += nbytes;
     due = tx->pace_origin_ns + tx->pace_bytes * 8000ull / (uint64_t)tx->rate_mbps;
-    /* 落后或领先不到 2ms 就继续发。落后的时间留在起点上，后面不再补睡。 */
-    if (due <= now + 2000000ull) {
+    /* 约 1ms 的量：rate_mbps * 1e6 / 8 / 1000。 */
+    cap = (uint64_t)tx->rate_mbps * 125ull;
+    if (cap < 1500ull) {
+        cap = 1500ull;
+    }
+    /* 落后不补睡。领先不到 2ms、并且这一串还没到约 1ms 的量，就继续发。 */
+    if (due <= now) {
+        tx->pace_burst = nbytes;
         tx->pace_skips++;
         return;
     }
-    ts.tv_sec = (time_t)(due / 1000000000ull);
-    ts.tv_nsec = (long)(due % 1000000000ull);
-    {
-        uint64_t t0 = mono_ns();
-        uint64_t lead = due > t0 ? due - t0 : 0;
-
-        tx->pace_intent_ns += lead;
-        tx->pace_sleeps++;
-        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
-        }
-        tx->pace_actual_ns += mono_ns() - t0;
+    if (tx->pace_burst < cap && due <= now + 2000000ull) {
+        tx->pace_skips++;
+        return;
     }
+    pace_wait(tx, due, now, nbytes);
 }
 
 /* 发送和接收是同一个套接字。阻塞的 send 会占着套接字锁，收包线程就读不到，
@@ -968,6 +992,8 @@ static int src_encode_gen(SrcPipe *p, uint32_t gen, SrcSlot *slot, uint8_t *bloc
 static void *src_worker(void *arg)
 {
     SrcPipe *p = arg;
+
+    pthread_setname_np(pthread_self(), "src-enc");
     uint8_t *block;
     uint8_t *payload;
 
@@ -1156,6 +1182,7 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
         nworkers = 0;
     }
     t0 = mono_ns();
+    pthread_setname_np(pthread_self(), "src-send");
     for (i = 0; i < nworkers; i++) {
         if (pthread_create(&workers[i], NULL, src_worker, &pipe) != 0) {
             pipe.failed = 1;
@@ -2120,6 +2147,7 @@ static void *relay_send_main(void *arg)
     size_t stride_max = (size_t)BATS_LINE_HDR + BATS_LINE_MAX_T;
 
     pin_core(2);
+    pthread_setname_np(pthread_self(), "rly-send");
     slotbuf = malloc(q->slot);
     batch = malloc(RELAY_TX_BATCH * stride_max);
     stash = malloc(stride_max);
@@ -2265,6 +2293,272 @@ static void relay_recv_fail(RxQueue *q)
     pthread_mutex_unlock(&q->mu);
 }
 
+/* 用户态环放不下时，先把内核套接字里的包拷到这里，再等环空出位置。
+   上限大约是一只套接字缓冲；再多说明重编码已经掉队，继续堆只会把内存吃光。 */
+#define RELAY_SPILL_MAX (64u * 1024u * 1024u)
+#define RELAY_SPILL_HARD (RELAY_SPILL_MAX + 32u * 1024u * 1024u)
+
+typedef struct {
+    uint8_t *buf;
+    size_t n;
+    size_t cap;
+} Spill;
+
+static void spill_free(Spill *sp)
+{
+    free(sp->buf);
+    sp->buf = NULL;
+    sp->n = 0;
+    sp->cap = 0;
+}
+
+static void spill_consume(Spill *sp, size_t off)
+{
+    if (off == 0) {
+        return;
+    }
+    if (off < sp->n) {
+        memmove(sp->buf, sp->buf + off, sp->n - off);
+    }
+    sp->n -= off;
+}
+
+static int spill_push(Spill *sp, size_t slot, uint32_t len, uint64_t arrival, const uint8_t *pkt)
+{
+    uint8_t *d;
+    uint8_t *nb;
+    size_t need;
+    size_t ncap;
+
+    need = sp->n + slot;
+    if (need > RELAY_SPILL_HARD) {
+        return -1;
+    }
+    if (need > sp->cap) {
+        ncap = sp->cap == 0 ? (1024u * 1024u) : sp->cap * 2u;
+        if (ncap < need) {
+            ncap = need;
+        }
+        if (ncap > RELAY_SPILL_HARD) {
+            ncap = RELAY_SPILL_HARD;
+        }
+        nb = realloc(sp->buf, ncap);
+        if (nb == NULL) {
+            return -1;
+        }
+        sp->buf = nb;
+        sp->cap = ncap;
+    }
+    d = sp->buf + sp->n;
+    put_u32(d, len);
+    memset(d + 4, 0, RELAY_SLOT_HDR - 4);
+    put_u64_raw(d + 8, arrival);
+    memcpy(d + RELAY_SLOT_HDR, pkt, len);
+    sp->n += slot;
+    return 0;
+}
+
+static void relay_prep_msgs(struct mmsghdr *msgs, struct iovec *iov, uint8_t *gro, size_t gro_cap,
+                            uint8_t *ctrl, size_t ctrl_stride)
+{
+    int i;
+
+    for (i = 0; i < RELAY_RX_BATCH; i++) {
+        iov[i].iov_base = gro + (size_t)i * gro_cap;
+        iov[i].iov_len = gro_cap;
+        msgs[i].msg_hdr.msg_name = NULL;
+        msgs[i].msg_hdr.msg_namelen = 0;
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_control = ctrl + (size_t)i * ctrl_stride;
+        msgs[i].msg_hdr.msg_controllen = ctrl_stride;
+        msgs[i].msg_hdr.msg_flags = 0;
+        msgs[i].msg_len = 0;
+    }
+}
+
+/* 返回 0 表示这一个合并包不能用。截断、拆不开、段长不对都算。 */
+static unsigned relay_resolve_seg(struct msghdr *hdr, unsigned total, size_t max_len)
+{
+    static int warned_split;
+    static int warned_seg;
+    unsigned seg;
+
+    if ((hdr->msg_flags & MSG_TRUNC) != 0 || total == 0) {
+        return 0;
+    }
+    seg = udp_gro_seg(hdr);
+    if (seg == 0) {
+        if (total <= max_len) {
+            return total;
+        }
+        if (max_len > 0 && total % (unsigned)max_len == 0) {
+            return (unsigned)max_len;
+        }
+        if (!warned_split) {
+            fprintf(stderr, "bats-line: 无法拆开合并包 total=%u\n", total);
+            warned_split = 1;
+        }
+        return 0;
+    }
+    if (seg > max_len) {
+        if (!warned_seg) {
+            fprintf(stderr, "bats-line: GRO 段长 %u 超过单包 %zu\n", seg, max_len);
+            warned_seg = 1;
+        }
+        return 0;
+    }
+    return seg;
+}
+
+/* 不持有 q->mu。把套接字里已经排队的包读进 spill，直到 EAGAIN，或 spill 达到上限。
+   返回 0 表示套接字已空，1 表示 spill 满了先停，-1 表示读失败或内存不足。 */
+static int relay_drain_socket(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struct iovec *iov,
+                              uint8_t *gro, size_t gro_cap, uint8_t *ctrl, size_t ctrl_stride,
+                              size_t max_len, uint32_t *ovfl)
+{
+    for (;;) {
+        int nmsg;
+        int i;
+        uint64_t arrival;
+
+        if (sp->n >= RELAY_SPILL_MAX) {
+            return 1;
+        }
+        relay_prep_msgs(msgs, iov, gro, gro_cap, ctrl, ctrl_stride);
+        nmsg = recvmmsg(q->fd, msgs, RELAY_RX_BATCH, MSG_DONTWAIT, NULL);
+        if (nmsg < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+            perror("bats-line: recvmmsg");
+            return -1;
+        }
+        if (nmsg == 0) {
+            return 0;
+        }
+        arrival = mono_ns();
+        for (i = 0; i < nmsg; i++) {
+            unsigned total = msgs[i].msg_len;
+            unsigned seg = relay_resolve_seg(&msgs[i].msg_hdr, total, max_len);
+            unsigned off = 0;
+            uint8_t *base = gro + (size_t)i * gro_cap;
+            uint32_t v;
+
+            v = 0;
+            {
+                struct cmsghdr *cmsg;
+
+                for (cmsg = CMSG_FIRSTHDR(&msgs[i].msg_hdr); cmsg != NULL;
+                     cmsg = CMSG_NXTHDR(&msgs[i].msg_hdr, cmsg)) {
+                    uint32_t one;
+
+                    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SO_RXQ_OVFL ||
+                        cmsg->cmsg_len < CMSG_LEN(sizeof(one))) {
+                        continue;
+                    }
+                    memcpy(&one, CMSG_DATA(cmsg), sizeof(one));
+                    if (one > v) {
+                        v = one;
+                    }
+                }
+            }
+            if (v > *ovfl) {
+                *ovfl = v;
+            }
+            if (seg == 0) {
+                continue;
+            }
+            while (off < total) {
+                unsigned n = seg;
+
+                if (total - off < n) {
+                    n = total - off;
+                }
+                if (n == 0) {
+                    break;
+                }
+                if (relay_pkt_ok(base + off, n, max_len)) {
+                    if (spill_push(sp, q->slot, n, arrival, base + off) != 0) {
+                        return -1;
+                    }
+                }
+                off += n;
+            }
+        }
+    }
+}
+
+/* 持有 q->mu。把 spill 写入环。环满之前先放开锁，把内核套接字读空，再等空位。
+   成功返回 0，失败或停止返回 -1。返回时仍持有锁。 */
+static int spill_into_ring(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struct iovec *iov,
+                           uint8_t *gro, size_t gro_cap, uint8_t *ctrl, size_t ctrl_stride,
+                           size_t max_len)
+{
+    size_t off = 0;
+    int since_drain = 256;
+    int wrote = 0;
+
+    for (;;) {
+        if (off >= sp->n) {
+            if (wrote) {
+                pthread_cond_signal(&q->data_cv);
+            }
+            sp->n = 0;
+            return 0;
+        }
+        if (q->stop) {
+            return -1;
+        }
+        if (q->ring->size + q->slot > q->ring->capacity || since_drain >= 256) {
+            int dr;
+            uint32_t extra = 0;
+
+            spill_consume(sp, off);
+            off = 0;
+            since_drain = 0;
+            if (wrote) {
+                pthread_cond_signal(&q->data_cv);
+                wrote = 0;
+            }
+            pthread_mutex_unlock(&q->mu);
+            dr = relay_drain_socket(q, sp, msgs, iov, gro, gro_cap, ctrl, ctrl_stride, max_len,
+                                    &extra);
+            pthread_mutex_lock(&q->mu);
+            if (extra > q->rx_ovfl) {
+                q->rx_ovfl = extra;
+            }
+            if (dr < 0) {
+                q->failed = 1;
+                q->ready = 1;
+                pthread_cond_signal(&q->data_cv);
+                return -1;
+            }
+            if (q->stop) {
+                return -1;
+            }
+            if (q->ring->size + q->slot > q->ring->capacity) {
+                pthread_cond_wait(&q->space_cv, &q->mu);
+            }
+            continue;
+        }
+        if (Buffer_Write(q->ring, sp->buf + off, q->slot) != CB_OK) {
+            q->failed = 1;
+            q->ready = 1;
+            pthread_cond_signal(&q->data_cv);
+            return -1;
+        }
+        q->last_rx_ns = get_u64_raw(sp->buf + off + 8);
+        q->enqueued++;
+        off += q->slot;
+        since_drain++;
+        wrote = 1;
+    }
+}
+
 static void *relay_recv_main(void *arg)
 {
     RxQueue *q = arg;
@@ -2277,8 +2571,10 @@ static void *relay_recv_main(void *arg)
     /* 内核一次最多合并约 64KB。按 64 个包留空，避免 MSG_TRUNC 把一整串丢掉。 */
     size_t gro_cap = 64u * max_len;
     size_t ctrl_stride = 256;
+    Spill spill;
     int i;
 
+    memset(&spill, 0, sizeof(spill));
     msgs = calloc(RELAY_RX_BATCH, sizeof(*msgs));
     iov = calloc(RELAY_RX_BATCH, sizeof(*iov));
     gro = malloc(RELAY_RX_BATCH * gro_cap);
@@ -2295,6 +2591,9 @@ static void *relay_recv_main(void *arg)
     }
     if (q->core >= 0) {
         pin_core(q->core);
+        pthread_setname_np(pthread_self(), "rly-recv");
+    } else {
+        pthread_setname_np(pthread_self(), "dst-recv");
     }
     (void)setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), -10);
     pthread_mutex_lock(&q->mu);
@@ -2329,20 +2628,10 @@ static void *relay_recv_main(void *arg)
         for (;;) {
             int nmsg;
             int nvalid = 0;
+            int spilled = 0;
             uint64_t arrival;
 
-            for (i = 0; i < RELAY_RX_BATCH; i++) {
-                iov[i].iov_base = gro + (size_t)i * gro_cap;
-                iov[i].iov_len = gro_cap;
-                msgs[i].msg_hdr.msg_name = NULL;
-                msgs[i].msg_hdr.msg_namelen = 0;
-                msgs[i].msg_hdr.msg_iov = &iov[i];
-                msgs[i].msg_hdr.msg_iovlen = 1;
-                msgs[i].msg_hdr.msg_control = ctrl + (size_t)i * ctrl_stride;
-                msgs[i].msg_hdr.msg_controllen = ctrl_stride;
-                msgs[i].msg_hdr.msg_flags = 0;
-                msgs[i].msg_len = 0;
-            }
+            relay_prep_msgs(msgs, iov, gro, gro_cap, ctrl, ctrl_stride);
             nmsg = recvmmsg(q->fd, msgs, RELAY_RX_BATCH, MSG_DONTWAIT, NULL);
             if (nmsg < 0) {
                 if (errno == EINTR) {
@@ -2362,35 +2651,12 @@ static void *relay_recv_main(void *arg)
             pthread_mutex_lock(&q->mu);
             for (i = 0; i < nmsg; i++) {
                 unsigned total = msgs[i].msg_len;
-                unsigned seg = udp_gro_seg(&msgs[i].msg_hdr);
+                unsigned seg = relay_resolve_seg(&msgs[i].msg_hdr, total, max_len);
                 unsigned off = 0;
                 uint8_t *base = gro + (size_t)i * gro_cap;
 
                 relay_note_ovfl(q, &msgs[i].msg_hdr);
-                if ((msgs[i].msg_hdr.msg_flags & MSG_TRUNC) != 0 || total == 0) {
-                    continue;
-                }
                 if (seg == 0) {
-                    if (total <= max_len) {
-                        seg = total;
-                    } else if (max_len > 0 && total % (unsigned)max_len == 0) {
-                        seg = (unsigned)max_len;
-                    } else {
-                        static int warned;
-
-                        if (!warned) {
-                            fprintf(stderr, "bats-line: 无法拆开合并包 total=%u\n", total);
-                            warned = 1;
-                        }
-                        continue;
-                    }
-                } else if (seg > max_len) {
-                    static int warned;
-
-                    if (!warned) {
-                        fprintf(stderr, "bats-line: GRO 段长 %u 超过单包 %zu\n", seg, max_len);
-                        warned = 1;
-                    }
                     continue;
                 }
                 while (off < total) {
@@ -2402,14 +2668,22 @@ static void *relay_recv_main(void *arg)
                     if (n == 0) {
                         break;
                     }
-                    if (relay_pkt_ok(base + off, n, max_len)) {
-                        while (q->ring->size + q->slot > q->ring->capacity && !q->stop) {
-                            pthread_cond_wait(&q->space_cv, &q->mu);
-                        }
-                        if (q->stop) {
+                    if (!relay_pkt_ok(base + off, n, max_len)) {
+                        off += n;
+                        continue;
+                    }
+                    /* 环满时不能停在这里等。先把已经读出的包和套接字里剩下的包放进 spill，
+                       再等空位，否则内核队列会在等待期间满掉。 */
+                    if (spilled || q->ring->size + q->slot > q->ring->capacity) {
+                        if (spill_push(&spill, q->slot, n, arrival, base + off) != 0) {
+                            q->failed = 1;
+                            q->ready = 1;
+                            pthread_cond_signal(&q->data_cv);
                             pthread_mutex_unlock(&q->mu);
                             goto done;
                         }
+                        spilled = 1;
+                    } else {
                         put_u32(scratch, n);
                         put_u64_raw(scratch + 8, arrival);
                         memcpy(scratch + RELAY_SLOT_HDR, base + off, n);
@@ -2430,10 +2704,17 @@ static void *relay_recv_main(void *arg)
             if (nvalid > 0) {
                 pthread_cond_signal(&q->data_cv);
             }
+            if (spilled &&
+                spill_into_ring(q, &spill, msgs, iov, gro, gro_cap, ctrl, ctrl_stride, max_len) !=
+                    0) {
+                pthread_mutex_unlock(&q->mu);
+                goto done;
+            }
             pthread_mutex_unlock(&q->mu);
         }
     }
 done:
+    spill_free(&spill);
     free(msgs);
     free(iov);
     free(gro);
@@ -2615,6 +2896,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
     }
     send_started = 1;
     pin_core(1);
+    pthread_setname_np(pthread_self(), "rly-calc");
     rx.last_ns = q.last_rx_ns;
     for (;;) {
         uint32_t len = 0;
@@ -3198,6 +3480,8 @@ static void *dest_worker(void *arg)
 {
     DestPool *pool = arg;
 
+    pthread_setname_np(pthread_self(), "dst-dec");
+
     for (;;) {
         GenBuf *g = NULL;
         int fi;
@@ -3768,6 +4052,7 @@ static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int r
         pthread_mutex_unlock(&q.mu);
     }
     fprintf(stderr, "bats-line: listening\n");
+    pthread_setname_np(pthread_self(), "dst-main");
     for (;;) {
         uint32_t len = 0;
         uint64_t arrival = 0;
@@ -3943,6 +4228,8 @@ out:
         pthread_mutex_unlock(&q.mu);
         pthread_join(recv_th, NULL);
     }
+    fprintf(stderr, "bats-line: dest socket_drops=%u enqueued=%" PRIu64 "\n", q.rx_ovfl,
+            q.enqueued);
     free(slotbuf);
     if (q.ring != NULL) {
         Buffer_Destroy(&q.ring);
