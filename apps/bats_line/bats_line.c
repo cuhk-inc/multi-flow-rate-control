@@ -17,10 +17,13 @@
  *
  * UDP 只多了传输需要的头：flow_id、generation、batch_id、8 字节系数、T 字节载荷。
  * 每个 DATA 都带上 file_size、K、batch 数和 generation 数。
+ * 同一代里按包序号交错发送：先发每个 batch 的第 0 个包，再发第 1 个。
+ * 连续丢包因此打进不同的 batch，而不是打穿同一个 batch。
  * 中继收齐一个 batch 就 bats_recode 并转发。收包、重编码、发送各是一个线程，
- * 并分别绑在三个核上。缺包的 batch 留到这一跳空闲达到 idle-sec 再发。
- * 目的端收齐一个 generation 就译；缺包的 generation 也留到
- * 空闲达到 idle-sec 再译。一代的缓冲在第一个包到达时分配，译完释放。各代并行译。
+ * 并分别绑在三个核上。缺包的 batch 在看到更新的 generation 之后，再留
+ * reorder-ms 等晚到的包，然后才重编码。目的端对缺包的 generation 同样等。
+ * 收齐的 generation 立即译。一直等不到的，空闲达到 idle-sec 再译。
+ * 一代的缓冲在第一个包到达时分配，译完释放。各代并行译。
  * 丢包只作用在 DATA 上，发生在 sendmmsg 之前。END 不丢。
  *
  * 度数：源和目的启动时若工作目录有 psi_network.txt 就装上它，否则用 psi_line.h。
@@ -116,6 +119,11 @@ typedef struct {
     size_t pkt_cap;
     int gso_off;
     struct RxQueue *outq;
+    struct TxStripe *stripe;
+    /* split_flow 是交给 next2 的第一条流。未设置时全部发往 next。 */
+    struct sockaddr_in next2;
+    int have_next2;
+    unsigned split_flow;
 } Tx;
 
 typedef struct RxQueue RxQueue;
@@ -175,6 +183,18 @@ static uint32_t get_u32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* 包头第 6 字节起是 flow_id。第二目的只在中继发送线程上生效。 */
+static struct sockaddr_in *tx_hop(Tx *tx, const uint8_t *pkt)
+{
+    if (!tx->have_next2) {
+        return &tx->next;
+    }
+    if (get_u16(pkt + 6) >= tx->split_flow) {
+        return &tx->next2;
+    }
+    return &tx->next;
 }
 
 static int parse_u32(const char *s, uint32_t *out)
@@ -287,24 +307,23 @@ static int drop_data(Tx *tx)
     return (int)(tx->loss_state % 100ull) < tx->loss_percent;
 }
 
-/* 领先达到 2ms 用绝对时间睡眠。不到 2ms 不能 nanosleep，虚拟机会把短睡眠拉长，
-   所以空转到点。调用前 due > now。睡完后这一串从当前这次的字节重新计。 */
+/* 领先达到 2ms 才用绝对时间睡眠。更短的 nanosleep 在虚拟机里会被拉长，空转又会占满一个核。
+   不到 2ms 就继续发，攒到一次真正的睡眠。调用前 due > now。睡完后这一串从当前这次的字节重新计。 */
 static void pace_wait(Tx *tx, uint64_t due, uint64_t now, size_t nbytes)
 {
     struct timespec ts;
     uint64_t t0 = now;
     uint64_t lead = due - now;
 
+    if (lead < 2000000ull) {
+        tx->pace_skips++;
+        return;
+    }
     tx->pace_intent_ns += lead;
     tx->pace_sleeps++;
-    if (lead >= 2000000ull) {
-        ts.tv_sec = (time_t)(due / 1000000000ull);
-        ts.tv_nsec = (long)(due % 1000000000ull);
-        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
-        }
-    } else {
-        while (mono_ns() < due) {
-        }
+    ts.tv_sec = (time_t)(due / 1000000000ull);
+    ts.tv_nsec = (long)(due % 1000000000ull);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
     }
     tx->pace_actual_ns += mono_ns() - t0;
     tx->pace_burst = nbytes;
@@ -314,7 +333,6 @@ static void pace(Tx *tx, size_t nbytes)
 {
     uint64_t now;
     uint64_t due;
-    uint64_t cap;
 
     if (tx->rate_mbps <= 0 || nbytes == 0) {
         return;
@@ -326,18 +344,13 @@ static void pace(Tx *tx, size_t nbytes)
     tx->pace_bytes += nbytes;
     tx->pace_burst += nbytes;
     due = tx->pace_origin_ns + tx->pace_bytes * 8000ull / (uint64_t)tx->rate_mbps;
-    /* 约 1ms 的量：rate_mbps * 1e6 / 8 / 1000。 */
-    cap = (uint64_t)tx->rate_mbps * 125ull;
-    if (cap < 1500ull) {
-        cap = 1500ull;
-    }
-    /* 落后不补睡。领先不到 2ms、并且这一串还没到约 1ms 的量，就继续发。 */
+    /* 落后不补睡。领先不到 2ms 继续发，避免空转。 */
     if (due <= now) {
         tx->pace_burst = nbytes;
         tx->pace_skips++;
         return;
     }
-    if (tx->pace_burst < cap && due <= now + 2000000ull) {
+    if (due < now + 2000000ull) {
         tx->pace_skips++;
         return;
     }
@@ -527,15 +540,20 @@ static int precode_matches(const uint8_t *block, int K, int T, uint64_t seed)
     return ok;
 }
 
-static uint32_t batches_line(int K)
+static uint32_t batches_line(int K, int loss_percent)
 {
     int n;
 
     /* 优化后的 Ψ 在 K=128、两跳、0% 和 5% 丢包下 18 个 batch 就能还原。
-       预编码后大约按每个中间包 0.15 个 batch，K=131 得到 20。 */
+       预编码后大约按每个中间包 0.15 个 batch，K=131 得到 20。
+       源和两台中继各丢一次时，20 个 batch 在 6000 代里仍有 3 代失活方程组解不开。
+       丢包打开后再留 4 个 batch。0% 仍用 20，不增加零丢包的线上开销。 */
     n = (K * 19 + 127) / 128;
     if (n < 8) {
         n = 8;
+    }
+    if (loss_percent > 0) {
+        n += 4;
     }
     return (uint32_t)n;
 }
@@ -549,6 +567,68 @@ static uint64_t mbps_of(uint64_t bytes, uint64_t elapsed_ns)
 }
 
 /* 一个 batch 的若干包一次 sendmmsg。返回实际发出的包数，失败返回 -1。丢弃的包不计入返回值。 */
+#define RELAY_STRIPE_BATCHES 8
+/* 少于这么多个 batch 时继续等后面的 batch 一起交错。
+   只剩一个 batch 时，8 个包会连着发出，一次大约 5 个包的突发就能抹掉整个 batch。 */
+#define RELAY_STRIPE_MIN 4
+#define RELAY_STRIPE_HOLD_NS 8000000ull
+
+struct TxStripe {
+    int n;
+    int n_pkts[RELAY_STRIPE_BATCHES];
+    uint32_t len;
+    uint64_t t0_ns;
+    uint8_t *pkt;
+};
+
+static int tx_stripe_flush(Tx *tx)
+{
+    struct TxStripe *st = tx->stripe;
+    int b;
+    int j;
+    size_t stride_max = (size_t)BATS_LINE_HDR + BATS_LINE_MAX_T;
+
+    if (st == NULL || st->n <= 0) {
+        return 0;
+    }
+    for (j = 0; j < BATS_M; j++) {
+        for (b = 0; b < st->n; b++) {
+            if (j >= st->n_pkts[b]) {
+                continue;
+            }
+            if (queue_push(tx->outq,
+                           st->pkt + ((size_t)b * (size_t)BATS_M + (size_t)j) * stride_max,
+                           st->len, 1) != 0) {
+                return -1;
+            }
+        }
+    }
+    st->n = 0;
+    st->t0_ns = 0;
+    return 0;
+}
+
+/* 该把积着的 batch 发出去时返回 0，还要再等则返回剩余毫秒，没有积包返回 -1。 */
+static int tx_stripe_wait_ms(const Tx *tx)
+{
+    const struct TxStripe *st = tx->stripe;
+    uint64_t age;
+    int left;
+
+    if (st == NULL || st->n < RELAY_STRIPE_MIN) {
+        return -1;
+    }
+    age = since_ns(mono_ns(), st->t0_ns);
+    if (age >= RELAY_STRIPE_HOLD_NS) {
+        return 0;
+    }
+    left = (int)((RELAY_STRIPE_HOLD_NS - age) / 1000000ull);
+    if (left < 1) {
+        left = 1;
+    }
+    return left;
+}
+
 static int send_coded(Tx *tx, uint16_t flow_id, uint32_t gen, uint32_t batch, unsigned T,
                       const uint8_t *coeff, const uint8_t *payload, int n_pkts,
                       uint32_t file_size, uint32_t k_pkts, uint32_t n_batches, uint32_t n_gens)
@@ -569,7 +649,46 @@ static int send_coded(Tx *tx, uint16_t flow_id, uint32_t gen, uint32_t batch, un
     if (tx->outq != NULL) {
         uint8_t pkt[BATS_LINE_HDR + BATS_LINE_MAX_T];
         int queued = 0;
+        struct TxStripe *st = tx->stripe;
+        size_t stride_max = (size_t)BATS_LINE_HDR + BATS_LINE_MAX_T;
 
+        if (st != NULL) {
+            int slot = st->n;
+
+            if (slot >= RELAY_STRIPE_BATCHES && tx_stripe_flush(tx) != 0) {
+                return -1;
+            }
+            slot = st->n;
+            for (j = 0; j < n_pkts; j++) {
+                uint8_t *dst = st->pkt + ((size_t)slot * (size_t)BATS_M + (size_t)j) * stride_max;
+
+                memset(dst, 0, BATS_LINE_HDR);
+                put_u32(dst + 0, BATS_LINE_MAGIC);
+                dst[4] = BATS_LINE_VERSION;
+                dst[5] = BATS_LINE_DATA;
+                put_u16(dst + 6, flow_id);
+                put_u32(dst + 8, gen);
+                put_u32(dst + 12, batch);
+                put_u16(dst + 16, (unsigned)j);
+                put_u16(dst + 18, T);
+                put_u32(dst + 20, file_size);
+                put_u32(dst + 24, k_pkts);
+                put_u32(dst + 28, n_batches);
+                put_u32(dst + 32, n_gens);
+                memcpy(dst + 36, coeff + (size_t)j * BATS_M, BATS_M);
+                memcpy(dst + BATS_LINE_HDR, payload + (size_t)j * T, T);
+            }
+            if (st->n == 0) {
+                st->t0_ns = mono_ns();
+            }
+            st->n_pkts[slot] = n_pkts;
+            st->len = (uint32_t)stride;
+            st->n++;
+            if (st->n >= RELAY_STRIPE_BATCHES && tx_stripe_flush(tx) != 0) {
+                return -1;
+            }
+            return n_pkts;
+        }
         for (j = 0; j < n_pkts; j++) {
             memset(pkt, 0, BATS_LINE_HDR);
             put_u32(pkt + 0, BATS_LINE_MAGIC);
@@ -663,7 +782,7 @@ static int send_coded(Tx *tx, uint16_t flow_id, uint32_t gen, uint32_t batch, un
 
 /* 整段已经排好的 UDP 载荷一次送进内核，由 UDP_SEGMENT 切成 stride 字节的数据报。
    成功返回 0。一个字节都没送出返回 -1，调用方可以改走 sendmmsg。送出了一部分返回 -2。 */
-static int send_gso(Tx *tx, const uint8_t *data, int n_pkts, size_t stride)
+static int send_gso(Tx *tx, const uint8_t *data, int n_pkts, size_t stride, struct sockaddr_in *to)
 {
     struct msghdr msg;
     struct iovec iov;
@@ -680,8 +799,11 @@ static int send_gso(Tx *tx, const uint8_t *data, int n_pkts, size_t stride)
     memset(control, 0, sizeof(control));
     iov.iov_base = (void *)data;
     iov.iov_len = (size_t)n_pkts * stride;
-    msg.msg_name = &tx->next;
-    msg.msg_namelen = sizeof(tx->next);
+    if (to == NULL) {
+        to = &tx->next;
+    }
+    msg.msg_name = to;
+    msg.msg_namelen = sizeof(*to);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control;
@@ -758,7 +880,7 @@ static int send_burst(Tx *tx, const uint8_t *pkts, int n_pkts, size_t stride)
             if (n > cap) {
                 n = cap;
             }
-            gr = send_gso(tx, pkts + (size_t)i * stride, n, stride);
+            gr = send_gso(tx, pkts + (size_t)i * stride, n, stride, &tx->next);
             if (gr == 0) {
                 i += n;
                 continue;
@@ -1064,6 +1186,33 @@ static void *src_worker(void *arg)
     }
 }
 
+/* 同一代按包序号交错。内存里仍是 batch 优先，这里排成第 j 个包跨过所有 batch 再发。
+   连续丢的几个包就落进不同的 batch。scratch 由调用方准备，长度至少 n_batches * M * stride。 */
+static int send_striped(Tx *tx, const uint8_t *pkts, uint32_t n_batches, size_t stride,
+                        uint8_t *scratch)
+{
+    uint32_t j;
+    uint32_t batch;
+    size_t n_pkts;
+
+    if (n_batches == 0 || stride == 0) {
+        return -1;
+    }
+    n_pkts = (size_t)n_batches * (size_t)BATS_M;
+    if (n_batches == 1) {
+        return send_burst(tx, pkts, (int)n_pkts, stride);
+    }
+    for (j = 0; j < (uint32_t)BATS_M; j++) {
+        for (batch = 0; batch < n_batches; batch++) {
+            size_t src = ((size_t)batch * (size_t)BATS_M + (size_t)j) * stride;
+            size_t dst = ((size_t)j * (size_t)n_batches + (size_t)batch) * stride;
+
+            memcpy(scratch + dst, pkts + src, stride);
+        }
+    }
+    return send_burst(tx, scratch, (int)n_pkts, stride);
+}
+
 static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                       uint32_t n_batches_arg, uint16_t flow_id, int n_flows, int worker_arg)
 {
@@ -1125,7 +1274,7 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
     n_gens = file_size == 0
                  ? 0u
                  : (uint32_t)(((size_t)file_size + gen_bytes - 1u) / gen_bytes);
-    n_batches = n_batches_arg == 0 ? batches_line(coded_k) : n_batches_arg;
+    n_batches = n_batches_arg == 0 ? batches_line(coded_k, tx->loss_percent) : n_batches_arg;
     if (n_batches < 1u) {
         n_batches = 1u;
     }
@@ -1192,7 +1341,14 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
     }
     {
         uint32_t gen;
+        uint8_t *stripe;
+        size_t stripe_bytes = (size_t)n_batches * (size_t)BATS_M * pipe.stride;
 
+        stripe = malloc(stripe_bytes == 0 ? 1 : stripe_bytes);
+        if (stripe == NULL) {
+            pipe.failed = 1;
+            die("交错发送的缓冲区不足");
+        }
         for (gen = 0; gen < n_gens && !pipe.failed; gen++) {
             int base;
 
@@ -1223,12 +1379,12 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                 if (pipe.failed) {
                     break;
                 }
-                /* 一条流仍一次发完这一代。多条流按 batch 交错，线上同时有这些流的包。 */
+                /* 一代内部按包序号交错。多条流仍按 batch 组轮流，组内同样交错。 */
                 if (group == 1) {
                     uint32_t job = gen * (uint32_t)pipe.n_flows + (uint32_t)base;
                     int si = (int)(job % SRC_WIN);
 
-                    if (send_burst(tx, pipe.slot[si].pkts, (int)n_batches * BATS_M, pipe.stride) !=
+                    if (send_striped(tx, pipe.slot[si].pkts, n_batches, pipe.stride, stripe) !=
                         0) {
                         pthread_mutex_lock(&pipe.mu);
                         pipe.failed = 1;
@@ -1252,7 +1408,7 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                             uint8_t *pkts = pipe.slot[si].pkts +
                                             (size_t)batch * (size_t)BATS_M * pipe.stride;
 
-                            if (send_burst(tx, pkts, (int)step * BATS_M, pipe.stride) != 0) {
+                            if (send_striped(tx, pkts, step, pipe.stride, stripe) != 0) {
                                 pthread_mutex_lock(&pipe.mu);
                                 pipe.failed = 1;
                                 pthread_cond_broadcast(&pipe.cv);
@@ -1277,6 +1433,7 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                 base += group;
             }
         }
+        free(stripe);
     }
     pthread_mutex_lock(&pipe.mu);
     pthread_cond_broadcast(&pipe.cv);
@@ -1310,12 +1467,16 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
                 "bats-line: role=source unit_coeff_ok=1 flows=%d workers=%d data_packets=%" PRIu64
                 " loss_drops=%" PRIu64 " wire_bytes=%" PRIu64
                 " elapsed_ms=%" PRIu64 " achieved_mbps=%" PRIu64
+                " raw_bytes=%" PRIu64 " raw_mbps=%" PRIu64
                 " target_mbps=%d pace_intent_us=%" PRIu64
                 " pace_actual_us=%" PRIu64 " pace_sleeps=%" PRIu64
                 " pace_skips=%" PRIu64 "\n",
                 pipe.n_flows, started, data_packets, tx->dropped, tx->wire_bytes,
                 (uint64_t)(elapsed_ns / 1000000ull),
-                mbps_of(tx->wire_bytes, elapsed_ns), tx->rate_mbps,
+                mbps_of(tx->wire_bytes, elapsed_ns),
+                (uint64_t)file_size * (uint64_t)pipe.n_flows,
+                mbps_of((uint64_t)file_size * (uint64_t)pipe.n_flows, elapsed_ns),
+                tx->rate_mbps,
                 (uint64_t)(tx->pace_intent_ns / 1000u),
                 (uint64_t)(tx->pace_actual_ns / 1000u),
                 tx->pace_sleeps, tx->pace_skips);
@@ -1324,6 +1485,10 @@ static int run_source(const char *path, Tx *tx, int K, int T, uint64_t seed,
 }
 
 #define RELAY_SLOTS 2048
+/* 未完成的 generation 超过这个数就先译最老的。22 个 batch 一代大约 250KB，
+   32 代约 8MB。目的端等待两倍 reorder-ms；10ms 时等 20ms，32 代能盖住
+   2 Gbit/s 以上，由等待时间关代，而不是这个上限。 */
+#define DEST_INFLIGHT_CAP 32
 #define GEN_FILLING 1
 #define GEN_QUEUED 2
 #define GEN_DECODING 3
@@ -1342,6 +1507,19 @@ typedef struct {
 } RelaySlot;
 
 typedef struct {
+    uint8_t *bits;
+    uint32_t n_gens;
+    uint32_t stride;
+} FlowFlush;
+
+/* 按 flow_id、generation 直接定位。流号不小于 BATS_MAX_FLOWS 时退回线性表。 */
+typedef struct {
+    FlowFlush flow[BATS_MAX_FLOWS];
+    struct FlushedGen *extra;
+    int nextra;
+} FlushSet;
+
+typedef struct FlushedGen {
     uint16_t flow_id;
     uint32_t gen_id;
     uint8_t *bits;
@@ -1360,6 +1538,8 @@ typedef struct {
     uint64_t recode_state;
     uint64_t full_n;
     uint64_t batch_n;
+    uint32_t high_gen;
+    int have_high;
 } FlowRx;
 
 typedef struct {
@@ -1368,6 +1548,7 @@ typedef struct {
     uint64_t recode_seed;
     int expect_flows;
     int n_flows;
+    int reorder_ms;
     int16_t flow_at[BATS_MAX_FLOWS];
     FlowRx flow[BATS_MAX_FLOWS];
 } RxMeta;
@@ -1405,6 +1586,8 @@ typedef struct {
     unsigned char *touched;
     unsigned char *finished;
     unsigned char *ranked;
+    uint32_t high_gen;
+    int have_high;
 } DestFlow;
 
 typedef struct {
@@ -1428,7 +1611,9 @@ typedef struct {
     uint64_t symbols;
     int bp_sum;
     int inact_sum;
+    int bad_gens;
     int fit_psi;
+    int reorder_ms;
     int rank_hist[BATS_M + 1];
 } DestPool;
 
@@ -1516,51 +1701,64 @@ static void flow_note_complete(FlowRx *f)
     }
 }
 
-static int batch_was_flushed(FlushedGen *maps, int nmaps, uint16_t flow_id, uint32_t gen,
-                             uint32_t batch)
+static int batch_bit(const uint8_t *bits, size_t nbytes, uint32_t batch)
 {
-    int i;
     size_t byte = (size_t)batch >> 3;
 
-    for (i = 0; i < nmaps; i++) {
-        if (maps[i].flow_id != flow_id || maps[i].gen_id != gen) {
-            continue;
-        }
-        if (maps[i].bits == NULL || byte >= maps[i].nbytes) {
+    if (bits == NULL || byte >= nbytes) {
+        return 0;
+    }
+    return (bits[byte] >> (batch & 7u)) & 1;
+}
+
+static int batch_was_flushed(const FlushSet *set, uint16_t flow_id, uint32_t gen, uint32_t batch)
+{
+    const FlowFlush *f;
+    size_t byte;
+    int i;
+
+    if (flow_id < BATS_MAX_FLOWS) {
+        f = &set->flow[flow_id];
+        byte = (size_t)batch >> 3;
+        if (gen >= f->n_gens || byte >= f->stride) {
             return 0;
         }
-        return (maps[i].bits[byte] >> (batch & 7u)) & 1;
+        return batch_bit(f->bits + (size_t)gen * f->stride, f->stride, batch);
+    }
+    for (i = 0; i < set->nextra; i++) {
+        if (set->extra[i].flow_id == flow_id && set->extra[i].gen_id == gen) {
+            return batch_bit(set->extra[i].bits, set->extra[i].nbytes, batch);
+        }
     }
     return 0;
 }
 
-static int mark_flushed(FlushedGen **maps, int *nmaps, uint16_t flow_id, uint32_t gen,
-                        uint32_t batch)
+static int mark_extra(FlushSet *set, uint16_t flow_id, uint32_t gen, uint32_t batch)
 {
     int i;
     FlushedGen *m = NULL;
     size_t byte = (size_t)batch >> 3;
     size_t need = byte + 1;
     uint8_t *nb;
+    FlushedGen *nv;
 
-    for (i = 0; i < *nmaps; i++) {
-        if ((*maps)[i].flow_id == flow_id && (*maps)[i].gen_id == gen) {
-            m = &(*maps)[i];
+    for (i = 0; i < set->nextra; i++) {
+        if (set->extra[i].flow_id == flow_id && set->extra[i].gen_id == gen) {
+            m = &set->extra[i];
             break;
         }
     }
     if (m == NULL) {
-        FlushedGen *nv = realloc(*maps, (size_t)(*nmaps + 1) * sizeof(FlushedGen));
-
+        nv = realloc(set->extra, (size_t)(set->nextra + 1) * sizeof(FlushedGen));
         if (nv == NULL) {
             return -1;
         }
-        *maps = nv;
-        m = &nv[*nmaps];
+        set->extra = nv;
+        m = &nv[set->nextra];
         memset(m, 0, sizeof(*m));
         m->flow_id = flow_id;
         m->gen_id = gen;
-        (*nmaps)++;
+        set->nextra++;
     }
     if (m->nbytes < need) {
         nb = realloc(m->bits, need);
@@ -1575,14 +1773,64 @@ static int mark_flushed(FlushedGen **maps, int *nmaps, uint16_t flow_id, uint32_
     return 0;
 }
 
-static void free_flushed(FlushedGen *maps, int nmaps)
+static int mark_flushed(FlushSet *set, uint16_t flow_id, uint32_t gen, uint32_t batch)
+{
+    FlowFlush *f;
+    size_t byte = (size_t)batch >> 3;
+    uint32_t stride;
+    uint32_t n_gens;
+    uint8_t *nb;
+    uint32_t g;
+
+    if (flow_id >= BATS_MAX_FLOWS) {
+        return mark_extra(set, flow_id, gen, batch);
+    }
+    f = &set->flow[flow_id];
+    stride = f->stride == 0 ? (uint32_t)byte + 1u : f->stride;
+    if ((uint32_t)byte + 1u > stride) {
+        stride = (uint32_t)byte + 1u;
+    }
+    n_gens = f->n_gens;
+    if (gen >= n_gens) {
+        n_gens = gen + 1u;
+        if (n_gens < f->n_gens * 2u) {
+            n_gens = f->n_gens * 2u;
+        }
+        if (n_gens < 16u) {
+            n_gens = 16u;
+        }
+    }
+    if (n_gens != f->n_gens || stride != f->stride) {
+        nb = calloc((size_t)n_gens * stride, 1u);
+        if (nb == NULL) {
+            return -1;
+        }
+        for (g = 0; g < f->n_gens; g++) {
+            memcpy(nb + (size_t)g * stride, f->bits + (size_t)g * f->stride, f->stride);
+        }
+        free(f->bits);
+        f->bits = nb;
+        f->n_gens = n_gens;
+        f->stride = stride;
+    }
+    f->bits[(size_t)gen * f->stride + byte] |= (uint8_t)(1u << (batch & 7u));
+    return 0;
+}
+
+static void free_flushed(FlushSet *set)
 {
     int i;
 
-    for (i = 0; i < nmaps; i++) {
-        free(maps[i].bits);
+    for (i = 0; i < BATS_MAX_FLOWS; i++) {
+        free(set->flow[i].bits);
+        set->flow[i].bits = NULL;
     }
-    free(maps);
+    for (i = 0; i < set->nextra; i++) {
+        free(set->extra[i].bits);
+    }
+    free(set->extra);
+    set->extra = NULL;
+    set->nextra = 0;
 }
 
 static void slot_clear(RelaySlot *s)
@@ -1591,15 +1839,41 @@ static void slot_clear(RelaySlot *s)
     memset(s, 0, sizeof(*s));
 }
 
-static int slot_ready(const RelaySlot *s, int force)
+static int slot_ready(const RelaySlot *s, const RxMeta *rx, int force)
 {
+    int i;
+
     if (!s->used || s->n <= 0) {
         return 0;
     }
-    return force || s->n == BATS_M;
+    if (force || s->n == BATS_M) {
+        return 1;
+    }
+    /* 同一条流已经出现更新的 generation，缺包 batch 再留 reorder-ms。
+       这窗口只盖住时延抖动里晚到的包。reorder-ms 为 0 时立刻重编码，
+       避免缺包 batch 一直占到 2048 个槽满。 */
+    if (rx == NULL) {
+        return 0;
+    }
+    for (i = 0; i < rx->n_flows; i++) {
+        const FlowRx *f = &rx->flow[i];
+
+        if (f->used && f->flow_id == s->flow_id && f->have_high && s->gen_id < f->high_gen) {
+            uint64_t need;
+
+            if (rx->reorder_ms <= 0) {
+                return 1;
+            }
+            need = (uint64_t)rx->reorder_ms * 1000000ull;
+            if (since_ns(mono_ns(), s->last_ns) >= need) {
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
-static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *nmaps,
+static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushSet *flushed,
                       uint64_t *partial, uint64_t *full, uint64_t *recoded, uint64_t *data_out,
                       int *hist, uint64_t *busy_ns)
 {
@@ -1733,7 +2007,7 @@ static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *
     if (heap_out) {
         free(payload_out);
     }
-    if (mark_flushed(maps, nmaps, s->flow_id, s->gen_id, s->batch_id) != 0) {
+    if (mark_flushed(flushed, s->flow_id, s->gen_id, s->batch_id) != 0) {
         slot_clear(s);
         return -1;
     }
@@ -1741,7 +2015,7 @@ static int flush_slot(RelaySlot *s, RxMeta *rx, Tx *tx, FlushedGen **maps, int *
     return 0;
 }
 
-static int flush_ready(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, int *nmaps,
+static int flush_ready(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushSet *flushed,
                        uint64_t *partial, uint64_t *full, uint64_t *recoded, uint64_t *data_out,
                        int *hist, uint64_t *busy_ns, int force)
 {
@@ -1750,7 +2024,7 @@ static int flush_ready(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, 
         int i;
 
         for (i = 0; i < RELAY_SLOTS; i++) {
-            if (!slot_ready(&slots[i], force)) {
+            if (!slot_ready(&slots[i], rx, force)) {
                 continue;
             }
             if (best < 0 || slots[i].gen_id < slots[best].gen_id ||
@@ -1762,14 +2036,36 @@ static int flush_ready(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, 
         if (best < 0) {
             return 0;
         }
-        if (flush_slot(&slots[best], rx, tx, maps, nmaps, partial, full, recoded, data_out, hist,
+        if (flush_slot(&slots[best], rx, tx, flushed, partial, full, recoded, data_out, hist,
                        busy_ns) != 0) {
             return -1;
         }
     }
 }
 
-static int take_slot(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, int *nmaps,
+static int flush_oldest_slot(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushSet *flushed,
+                             uint64_t *partial, uint64_t *full, uint64_t *recoded,
+                             uint64_t *data_out, int *hist, uint64_t *busy_ns)
+{
+    int best = -1;
+    int i;
+
+    for (i = 0; i < RELAY_SLOTS; i++) {
+        if (!slots[i].used || slots[i].n <= 0) {
+            continue;
+        }
+        if (best < 0 || slots[i].last_ns < slots[best].last_ns) {
+            best = i;
+        }
+    }
+    if (best < 0) {
+        return -1;
+    }
+    return flush_slot(&slots[best], rx, tx, flushed, partial, full, recoded, data_out, hist,
+                      busy_ns);
+}
+
+static int take_slot(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushSet *flushed,
                      uint64_t *partial, uint64_t *full, uint64_t *recoded, uint64_t *data_out,
                      int *hist, uint64_t *busy_ns, uint16_t flow_id, uint32_t gen, uint32_t batch)
 {
@@ -1788,7 +2084,7 @@ static int take_slot(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, in
     if (free_i >= 0) {
         return free_i;
     }
-    if (flush_ready(slots, rx, tx, maps, nmaps, partial, full, recoded, data_out, hist, busy_ns,
+    if (flush_ready(slots, rx, tx, flushed, partial, full, recoded, data_out, hist, busy_ns,
                     0) != 0) {
         return -2;
     }
@@ -1800,10 +2096,22 @@ static int take_slot(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, in
     if (free_i >= 0) {
         return free_i;
     }
+    /* 丢包后缺一块的 batch 会一直占着槽，直到空闲超时。
+       1000 条流很快占满 2048 槽，之后每个新包都进 held，内存不设上限。
+       槽满时先把最久没更新的那一只部分 batch 发出去，腾出一个槽。 */
+    if (flush_oldest_slot(slots, rx, tx, flushed, partial, full, recoded, data_out, hist,
+                          busy_ns) != 0) {
+        return -2;
+    }
+    for (i = 0; i < RELAY_SLOTS; i++) {
+        if (!slots[i].used) {
+            return i;
+        }
+    }
     return -3;
 }
 
-static int relay_on_data(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps, int *nmaps,
+static int relay_on_data(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushSet *flushed,
                          uint64_t *partial, uint64_t *full, uint64_t *recoded, uint64_t *data_out,
                          int *hist, uint64_t *busy_ns, const uint8_t *buf, size_t len)
 {
@@ -1833,11 +2141,15 @@ static int relay_on_data(RelaySlot *slots, RxMeta *rx, Tx *tx, FlushedGen **maps
         return -1;
     }
     flow_note_meta(f, buf);
-    if (batch_was_flushed(*maps, *nmaps, flow_id, gen, batch)) {
+    if (!f->have_high || gen > f->high_gen) {
+        f->high_gen = gen;
+        f->have_high = 1;
+    }
+    if (batch_was_flushed(flushed, flow_id, gen, batch)) {
         rx->data_pkts++;
         return 0;
     }
-    si = take_slot(slots, rx, tx, maps, nmaps, partial, full, recoded, data_out, hist, busy_ns,
+    si = take_slot(slots, rx, tx, flushed, partial, full, recoded, data_out, hist, busy_ns,
                    flow_id, gen, batch);
     if (si == -3) {
         return -3;
@@ -1888,6 +2200,55 @@ static uint64_t idle_deadline_ms(int idle_sec, int ended)
     return ended ? one : one * 3ull;
 }
 
+/* 缺包 batch 还在等 reorder-ms 时，不要睡到 idle 超时才醒。返回剩余毫秒，没有这样的 batch 返回 -1。 */
+static int relay_reorder_wait_ms(const RelaySlot *slots, const RxMeta *rx)
+{
+    int i;
+    int wait = -1;
+    uint64_t now;
+    uint64_t need;
+
+    if (rx->reorder_ms <= 0) {
+        return -1;
+    }
+    now = mono_ns();
+    need = (uint64_t)rx->reorder_ms * 1000000ull;
+    for (i = 0; i < RELAY_SLOTS; i++) {
+        const RelaySlot *s = &slots[i];
+        int fi;
+        int newer = 0;
+        uint64_t age;
+        int left;
+
+        if (!s->used || s->n <= 0 || s->n >= BATS_M) {
+            continue;
+        }
+        for (fi = 0; fi < rx->n_flows; fi++) {
+            const FlowRx *f = &rx->flow[fi];
+
+            if (f->used && f->flow_id == s->flow_id && f->have_high && s->gen_id < f->high_gen) {
+                newer = 1;
+                break;
+            }
+        }
+        if (!newer) {
+            continue;
+        }
+        age = since_ns(now, s->last_ns);
+        if (age >= need) {
+            return 1;
+        }
+        left = (int)((need - age) / 1000000ull);
+        if (left < 1) {
+            left = 1;
+        }
+        if (wait < 0 || left < wait) {
+            wait = left;
+        }
+    }
+    return wait;
+}
+
 static int relay_wait_ms(const RxMeta *rx, int idle_sec)
 {
     uint64_t elapsed_ms = since_ns(mono_ns(), rx->last_ns) / 1000000ull;
@@ -1920,7 +2281,9 @@ static int relay_has_partial(const RelaySlot *slots)
     return 0;
 }
 
-#define RELAY_RING_BYTES (512u * 1024u * 1024u)
+/* 每台中继有收、发两个环。虚拟机大约 2.8GB 内存，512MB 一个环会把机器推进 swap。
+   128MB 在 1.2Gbit/s 下大约能存 0.8 秒。 */
+#define RELAY_RING_BYTES (128u * 1024u * 1024u)
 #define RELAY_SLOT_HDR 16u
 
 typedef struct RxQueue {
@@ -1937,6 +2300,8 @@ typedef struct RxQueue {
     int failed;
     uint32_t rx_ovfl;
     uint64_t enqueued;
+    uint64_t rx_bytes;
+    uint64_t first_rx_ns;
     uint64_t last_rx_ns;
 } RxQueue;
 
@@ -2053,7 +2418,7 @@ static int send_datagrams(Tx *tx, const uint8_t *pkts, int n_pkts, size_t stride
         while (i < n_pkts && nmsg < SEND_IOV) {
             iov[nmsg].iov_base = (void *)(pkts + (size_t)i * stride);
             iov[nmsg].iov_len = stride;
-            msgs[nmsg].msg_hdr.msg_name = &tx->next;
+            msgs[nmsg].msg_hdr.msg_name = tx_hop(tx, pkts + (size_t)i * stride);
             msgs[nmsg].msg_hdr.msg_namelen = sizeof(tx->next);
             msgs[nmsg].msg_hdr.msg_iov = &iov[nmsg];
             msgs[nmsg].msg_hdr.msg_iovlen = 1;
@@ -2097,7 +2462,7 @@ static int send_datagrams(Tx *tx, const uint8_t *pkts, int n_pkts, size_t stride
 }
 
 /* 等长 DATA 优先走 UDP_SEGMENT，一次系统调用切成多个数据报。切不开就退回 sendmmsg。 */
-static int send_train(Tx *tx, uint8_t *pkts, int n, size_t stride, int is_data)
+static int send_train(Tx *tx, uint8_t *pkts, int n, size_t stride, int is_data, struct sockaddr_in *to)
 {
     int cap;
     int off = 0;
@@ -2116,7 +2481,7 @@ static int send_train(Tx *tx, uint8_t *pkts, int n, size_t stride, int is_data)
         if (chunk > cap) {
             chunk = cap;
         }
-        gr = send_gso(tx, pkts + (size_t)off * stride, chunk, stride);
+        gr = send_gso(tx, pkts + (size_t)off * stride, chunk, stride, to);
         if (gr == 0) {
             off += chunk;
             continue;
@@ -2163,11 +2528,13 @@ static void *relay_send_main(void *arg)
         uint32_t stride = 0;
         int is_data = 0;
         int stop;
+        struct sockaddr_in *hop = NULL;
 
         if (have_stash) {
             memcpy(batch, stash, stash_len);
             stride = stash_len;
             is_data = stash_data;
+            hop = tx_hop(tx, stash);
             n = 1;
             have_stash = 0;
         }
@@ -2176,6 +2543,7 @@ static void *relay_send_main(void *arg)
             uint64_t arrival = 0;
             int popped;
             int data;
+            struct sockaddr_in *ph;
 
             popped = queue_pop(q, slotbuf, &len, &arrival);
             if (popped < 0) {
@@ -2185,7 +2553,7 @@ static void *relay_send_main(void *arg)
             if (popped == 0) {
                 break;
             }
-            if (len == 0 || (size_t)len > stride_max) {
+            if (len == 0 || (size_t)len > stride_max || len < BATS_LINE_HDR) {
                 relay_recv_fail(q);
                 goto done;
             }
@@ -2194,7 +2562,8 @@ static void *relay_send_main(void *arg)
                 tx->dropped++;
                 continue;
             }
-            if (n > 0 && (len != stride || data != is_data)) {
+            ph = tx_hop(tx, slotbuf + RELAY_SLOT_HDR);
+            if (n > 0 && (len != stride || data != is_data || ph != hop)) {
                 memcpy(stash, slotbuf + RELAY_SLOT_HDR, len);
                 stash_len = len;
                 stash_data = data;
@@ -2204,12 +2573,13 @@ static void *relay_send_main(void *arg)
             if (n == 0) {
                 stride = len;
                 is_data = data;
+                hop = ph;
             }
             memcpy(batch + (size_t)n * stride, slotbuf + RELAY_SLOT_HDR, len);
             n++;
         }
         if (n > 0) {
-            if (send_train(tx, batch, n, stride, is_data) != 0) {
+            if (send_train(tx, batch, n, stride, is_data, hop) != 0) {
                 relay_recv_fail(q);
                 break;
             }
@@ -2238,6 +2608,18 @@ static uint64_t queue_last_rx(RxQueue *q)
     v = q->last_rx_ns;
     pthread_mutex_unlock(&q->mu);
     return v;
+}
+
+/* 调用时已持有 q->mu。只计 DATA，END 不进译码前速率。 */
+static void queue_note_rx(RxQueue *q, uint32_t len, uint64_t arrival, int is_data)
+{
+    if (!is_data || len == 0) {
+        return;
+    }
+    if (q->rx_bytes == 0) {
+        q->first_rx_ns = arrival != 0 ? arrival : mono_ns();
+    }
+    q->rx_bytes += len;
 }
 
 #define RELAY_RX_BATCH 64
@@ -2300,6 +2682,7 @@ static void relay_recv_fail(RxQueue *q)
 
 typedef struct {
     uint8_t *buf;
+    size_t rd;
     size_t n;
     size_t cap;
 } Spill;
@@ -2308,19 +2691,30 @@ static void spill_free(Spill *sp)
 {
     free(sp->buf);
     sp->buf = NULL;
+    sp->rd = 0;
     sp->n = 0;
     sp->cap = 0;
 }
 
-static void spill_consume(Spill *sp, size_t off)
+static size_t spill_live(const Spill *sp)
 {
-    if (off == 0) {
+    return sp->n - sp->rd;
+}
+
+/* 只由收包线程调用，而且不能拿着队列锁。已读前缀留在原处，避免每写几百个槽就把整块缓存搬一次。 */
+static void spill_compact(Spill *sp)
+{
+    size_t live;
+
+    if (sp->rd == 0) {
         return;
     }
-    if (off < sp->n) {
-        memmove(sp->buf, sp->buf + off, sp->n - off);
+    live = sp->n - sp->rd;
+    if (live > 0) {
+        memmove(sp->buf, sp->buf + sp->rd, live);
     }
-    sp->n -= off;
+    sp->n = live;
+    sp->rd = 0;
 }
 
 static int spill_push(Spill *sp, size_t slot, uint32_t len, uint64_t arrival, const uint8_t *pkt)
@@ -2330,6 +2724,13 @@ static int spill_push(Spill *sp, size_t slot, uint32_t len, uint64_t arrival, co
     size_t need;
     size_t ncap;
 
+    /* 返回 1：前面已经读过的空间够用，调用方先在锁外整理再重试。 */
+    if (sp->rd > 0 && sp->n + slot > sp->cap) {
+        if (spill_live(sp) + slot > RELAY_SPILL_HARD) {
+            return -1;
+        }
+        return 1;
+    }
     need = sp->n + slot;
     if (need > RELAY_SPILL_HARD) {
         return -1;
@@ -2422,7 +2823,7 @@ static int relay_drain_socket(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struc
         int i;
         uint64_t arrival;
 
-        if (sp->n >= RELAY_SPILL_MAX) {
+        if (spill_live(sp) >= RELAY_SPILL_MAX) {
             return 1;
         }
         relay_prep_msgs(msgs, iov, gro, gro_cap, ctrl, ctrl_stride);
@@ -2482,7 +2883,13 @@ static int relay_drain_socket(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struc
                     break;
                 }
                 if (relay_pkt_ok(base + off, n, max_len)) {
-                    if (spill_push(sp, q->slot, n, arrival, base + off) != 0) {
+                    int pr = spill_push(sp, q->slot, n, arrival, base + off);
+
+                    if (pr == 1) {
+                        spill_compact(sp);
+                        pr = spill_push(sp, q->slot, n, arrival, base + off);
+                    }
+                    if (pr != 0) {
                         return -1;
                     }
                 }
@@ -2498,15 +2905,15 @@ static int spill_into_ring(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struct i
                            uint8_t *gro, size_t gro_cap, uint8_t *ctrl, size_t ctrl_stride,
                            size_t max_len)
 {
-    size_t off = 0;
     int since_drain = 256;
     int wrote = 0;
 
     for (;;) {
-        if (off >= sp->n) {
+        if (sp->rd >= sp->n) {
             if (wrote) {
                 pthread_cond_signal(&q->data_cv);
             }
+            sp->rd = 0;
             sp->n = 0;
             return 0;
         }
@@ -2517,14 +2924,16 @@ static int spill_into_ring(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struct i
             int dr;
             uint32_t extra = 0;
 
-            spill_consume(sp, off);
-            off = 0;
             since_drain = 0;
             if (wrote) {
                 pthread_cond_signal(&q->data_cv);
                 wrote = 0;
             }
             pthread_mutex_unlock(&q->mu);
+            /* 读指针超过剩余数据时再整理。整理发生在锁外，重编码线程可以继续取走环里的包。 */
+            if (sp->rd >= 256u * 1024u && sp->rd > spill_live(sp)) {
+                spill_compact(sp);
+            }
             dr = relay_drain_socket(q, sp, msgs, iov, gro, gro_cap, ctrl, ctrl_stride, max_len,
                                     &extra);
             pthread_mutex_lock(&q->mu);
@@ -2545,15 +2954,17 @@ static int spill_into_ring(RxQueue *q, Spill *sp, struct mmsghdr *msgs, struct i
             }
             continue;
         }
-        if (Buffer_Write(q->ring, sp->buf + off, q->slot) != CB_OK) {
+        if (Buffer_Write(q->ring, sp->buf + sp->rd, q->slot) != CB_OK) {
             q->failed = 1;
             q->ready = 1;
             pthread_cond_signal(&q->data_cv);
             return -1;
         }
-        q->last_rx_ns = get_u64_raw(sp->buf + off + 8);
+        q->last_rx_ns = get_u64_raw(sp->buf + sp->rd + 8);
+        queue_note_rx(q, get_u32(sp->buf + sp->rd), q->last_rx_ns,
+                      sp->buf[sp->rd + RELAY_SLOT_HDR + 5] == BATS_LINE_DATA);
         q->enqueued++;
-        off += q->slot;
+        sp->rd += q->slot;
         since_drain++;
         wrote = 1;
     }
@@ -2675,7 +3086,15 @@ static void *relay_recv_main(void *arg)
                     /* 环满时不能停在这里等。先把已经读出的包和套接字里剩下的包放进 spill，
                        再等空位，否则内核队列会在等待期间满掉。 */
                     if (spilled || q->ring->size + q->slot > q->ring->capacity) {
-                        if (spill_push(&spill, q->slot, n, arrival, base + off) != 0) {
+                        int pr = spill_push(&spill, q->slot, n, arrival, base + off);
+
+                        if (pr == 1) {
+                            pthread_mutex_unlock(&q->mu);
+                            spill_compact(&spill);
+                            pthread_mutex_lock(&q->mu);
+                            pr = spill_push(&spill, q->slot, n, arrival, base + off);
+                        }
+                        if (pr != 0) {
                             q->failed = 1;
                             q->ready = 1;
                             pthread_cond_signal(&q->data_cv);
@@ -2695,6 +3114,7 @@ static void *relay_recv_main(void *arg)
                             goto done;
                         }
                         q->last_rx_ns = arrival;
+                        queue_note_rx(q, n, arrival, base[off + 5] == BATS_LINE_DATA);
                         q->enqueued++;
                         nvalid++;
                     }
@@ -2734,7 +3154,7 @@ static int held_push(HeldPkt **arr, int *n, int *cap, const uint8_t *pkt, uint32
     uint8_t *copy;
     int ncap;
 
-    if (len == 0) {
+    if (len == 0 || *n >= 8192) {
         return -1;
     }
     if (*n == *cap) {
@@ -2779,8 +3199,9 @@ static void held_free(HeldPkt *arr, int n)
 static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int idle_sec,
                      int pkt_T, int expect_flows)
 {
+    tx->stripe = NULL;
     RelaySlot *slots = NULL;
-    FlushedGen *maps = NULL;
+    FlushSet flush;
     RxMeta rx;
     RxQueue q;
     RxQueue sq;
@@ -2796,12 +3217,13 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
     uint64_t recoded = 0;
     uint64_t data_out = 0;
     uint64_t busy_ns = 0;
-    int nmaps = 0;
+    uint64_t rx_t0 = 0;
     int hist[BATS_M + 1];
     int rc = 1;
     int started = 0;
     int failed = 0;
     uint32_t socket_drops = 0;
+    uint64_t rx_bytes = 0;
     size_t block = 256u * 1024u;
     size_t blocks;
     HeldPkt *held = NULL;
@@ -2811,9 +3233,19 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
     if (pkt_T < 1 || pkt_T > BATS_LINE_MAX_T) {
         die("relay 的 T 不合法");
     }
-    (void)reorder_ms;
+    memset(&flush, 0, sizeof(flush));
     memset(&rx, 0, sizeof(rx));
+    rx.reorder_ms = reorder_ms;
     rx.recode_seed = recode_seed ? recode_seed : 1;
+    tx->stripe = calloc(1, sizeof(*tx->stripe));
+    if (tx->stripe == NULL) {
+        die("relay 交错发送的缓冲区不足");
+    }
+    tx->stripe->pkt = malloc(RELAY_STRIPE_BATCHES * (size_t)BATS_M *
+                             ((size_t)BATS_LINE_HDR + BATS_LINE_MAX_T));
+    if (tx->stripe->pkt == NULL) {
+        die("relay 交错发送的缓冲区不足");
+    }
     rx.expect_flows = expect_flows > 0 ? expect_flows : 1;
     memset(hist, 0, sizeof(hist));
     memset(&q, 0, sizeof(q));
@@ -2917,6 +3349,9 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
         if (popped > 0) {
             const uint8_t *pkt = slotbuf + RELAY_SLOT_HDR;
 
+            if (rx_t0 == 0) {
+                rx_t0 = arrival != 0 ? arrival : mono_ns();
+            }
             if (len < BATS_LINE_HDR || get_u32(pkt) != BATS_LINE_MAGIC ||
                 pkt[4] != BATS_LINE_VERSION) {
                 continue;
@@ -2937,7 +3372,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
             }
             (void)arrival;
             {
-                int prc = relay_on_data(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded,
+                int prc = relay_on_data(slots, &rx, tx, &flush, &partial, &full, &recoded,
                                         &data_out, hist, &busy_ns, pkt, len);
 
                 if (prc == -3) {
@@ -2946,7 +3381,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                         int placed = 0;
 
                         while (hi < nheld) {
-                            int hrc = relay_on_data(slots, &rx, tx, &maps, &nmaps, &partial, &full,
+                            int hrc = relay_on_data(slots, &rx, tx, &flush, &partial, &full,
                                                     &recoded, &data_out, hist, &busy_ns,
                                                     held[hi].data, held[hi].len);
 
@@ -2955,7 +3390,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                                 continue;
                             }
                             if (hrc != 0 ||
-                                flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full,
+                                flush_ready(slots, &rx, tx, &flush, &partial, &full,
                                             &recoded, &data_out, hist, &busy_ns, 0) != 0) {
                                 fprintf(stderr, "bats-line: bats_recode 失败\n");
                                 goto out;
@@ -2970,7 +3405,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                     continue;
                 }
                 if (prc != 0 ||
-                    flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded,
+                    flush_ready(slots, &rx, tx, &flush, &partial, &full, &recoded,
                                 &data_out, hist, &busy_ns, 0) != 0) {
                     fprintf(stderr, "bats-line: bats_recode 失败\n");
                     goto out;
@@ -2991,7 +3426,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
             int hi = 0;
 
             while (hi < nheld) {
-                int hrc = relay_on_data(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded,
+                int hrc = relay_on_data(slots, &rx, tx, &flush, &partial, &full, &recoded,
                                         &data_out, hist, &busy_ns, held[hi].data, held[hi].len);
 
                 if (hrc == -3) {
@@ -2999,7 +3434,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                     continue;
                 }
                 if (hrc != 0 ||
-                    flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded,
+                    flush_ready(slots, &rx, tx, &flush, &partial, &full, &recoded,
                                 &data_out, hist, &busy_ns, 0) != 0) {
                     fprintf(stderr, "bats-line: bats_recode 失败\n");
                     goto out;
@@ -3022,7 +3457,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                 flow_note_complete(&rx.flow[fi]);
             }
         }
-        if (flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded, &data_out, hist,
+        if (flush_ready(slots, &rx, tx, &flush, &partial, &full, &recoded, &data_out, hist,
                         &busy_ns, 0) != 0) {
             fprintf(stderr, "bats-line: bats_recode 失败\n");
             goto out;
@@ -3062,14 +3497,14 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                         rx.data_pkts, enqueued, ovfl);
                 goto out;
             }
-            if (flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded, &data_out,
+            if (flush_ready(slots, &rx, tx, &flush, &partial, &full, &recoded, &data_out,
                             hist, &busy_ns, 1) != 0) {
                 fprintf(stderr, "bats-line: bats_recode 失败\n");
                 goto out;
             }
             hi = 0;
             while (hi < nheld) {
-                int hrc = relay_on_data(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded,
+                int hrc = relay_on_data(slots, &rx, tx, &flush, &partial, &full, &recoded,
                                         &data_out, hist, &busy_ns, held[hi].data, held[hi].len);
 
                 if (hrc == -3) {
@@ -3082,7 +3517,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                 }
                 held_drop(held, &nheld, hi);
             }
-            if (flush_ready(slots, &rx, tx, &maps, &nmaps, &partial, &full, &recoded, &data_out,
+            if (flush_ready(slots, &rx, tx, &flush, &partial, &full, &recoded, &data_out,
                             hist, &busy_ns, 1) != 0) {
                 fprintf(stderr, "bats-line: bats_recode 失败\n");
                 goto out;
@@ -3094,6 +3529,13 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
             break;
         }
         wait = relay_wait_ms(&rx, idle_sec);
+        {
+            int reorder_wait = relay_reorder_wait_ms(slots, &rx);
+
+            if (reorder_wait > 0 && (wait < 0 || reorder_wait < wait)) {
+                wait = reorder_wait;
+            }
+        }
         if (wait < 0) {
             fprintf(stderr,
                     "bats-line: idle timeout before END packets=%" PRIu64
@@ -3101,12 +3543,31 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
                     rx.data_pkts, enqueued, ovfl);
             goto out;
         }
+        {
+            int stripe_wait = tx_stripe_wait_ms(tx);
+
+            if (stripe_wait == 0) {
+                if (tx_stripe_flush(tx) != 0) {
+                    fprintf(stderr, "bats-line: bats_recode 失败\n");
+                    goto out;
+                }
+                continue;
+            }
+            if (stripe_wait > 0 && stripe_wait < wait) {
+                wait = stripe_wait;
+            }
+        }
         queue_wait_ms(&q, wait);
     }
     {
         int fi;
         uint64_t expected = 0;
         uint64_t seen = 0;
+
+        if (tx_stripe_flush(tx) != 0) {
+            fprintf(stderr, "bats-line: bats_recode 失败\n");
+            goto out;
+        }
 
         for (fi = 0; fi < rx.n_flows; fi++) {
             if (!rx.flow[fi].have_meta) {
@@ -3136,6 +3597,7 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
     }
     pthread_mutex_lock(&q.mu);
     socket_drops = q.rx_ovfl;
+    rx_bytes = q.rx_bytes;
     pthread_mutex_unlock(&q.mu);
     if (send_started) {
         pthread_mutex_lock(&sq.mu);
@@ -3147,25 +3609,36 @@ static int run_relay(int fd, Tx *tx, uint64_t recode_seed, int reorder_ms, int i
         send_started = 0;
         tx->outq = NULL;
     }
-    fprintf(stderr,
-            "bats-line: role=relay api=bats_recode flows=%d batches_recoded=%" PRIu64
-            " partial_batches=%" PRIu64 " empty_batches=%" PRIu64
-            " full_batches=%" PRIu64 " packets_in=%" PRIu64
-            " packets_out=%" PRIu64 " loss_drops=%" PRIu64
-            " wire_bytes=%" PRIu64 " forward_ms=%" PRIu64
-            " achieved_mbps=%" PRIu64
-            " recv_hist=%d,%d,%d,%d,%d,%d,%d,%d,%d socket_drops=%u"
-            " pace_intent_us=%" PRIu64 " pace_actual_us=%" PRIu64
-            " pace_sleeps=%" PRIu64 " pace_skips=%" PRIu64 "\n",
-            rx.n_flows, recoded, partial, empty, full, rx.data_pkts, data_out, tx->dropped,
-            tx->wire_bytes, (uint64_t)(busy_ns / 1000000ull),
-            mbps_of(tx->wire_bytes, busy_ns), hist[0], hist[1], hist[2], hist[3], hist[4],
-            hist[5], hist[6], hist[7], hist[8], socket_drops,
-            (uint64_t)(tx->pace_intent_ns / 1000u),
-            (uint64_t)(tx->pace_actual_ns / 1000u),
-            tx->pace_sleeps, tx->pace_skips);
+    {
+        uint64_t wall_ns = rx_t0 == 0 ? busy_ns : mono_ns() - rx_t0;
+
+        fprintf(stderr,
+                "bats-line: role=relay api=bats_recode flows=%d batches_recoded=%" PRIu64
+                " partial_batches=%" PRIu64 " empty_batches=%" PRIu64
+                " full_batches=%" PRIu64 " packets_in=%" PRIu64
+                " packets_out=%" PRIu64 " loss_drops=%" PRIu64
+                " wire_bytes=%" PRIu64 " rx_bytes=%" PRIu64 " elapsed_ms=%" PRIu64
+                " forward_ms=%" PRIu64 " achieved_mbps=%" PRIu64
+                " rx_mbps=%" PRIu64 " busy_mbps=%" PRIu64
+                " recv_hist=%d,%d,%d,%d,%d,%d,%d,%d,%d socket_drops=%u"
+                " pace_intent_us=%" PRIu64 " pace_actual_us=%" PRIu64
+                " pace_sleeps=%" PRIu64 " pace_skips=%" PRIu64 "\n",
+                rx.n_flows, recoded, partial, empty, full, rx.data_pkts, data_out, tx->dropped,
+                tx->wire_bytes, rx_bytes, (uint64_t)(wall_ns / 1000000ull),
+                (uint64_t)(busy_ns / 1000000ull),
+                mbps_of(tx->wire_bytes, wall_ns), mbps_of(rx_bytes, wall_ns),
+                mbps_of(tx->wire_bytes, busy_ns), hist[0],
+                hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7], hist[8],
+                socket_drops, (uint64_t)(tx->pace_intent_ns / 1000u),
+                (uint64_t)(tx->pace_actual_ns / 1000u), tx->pace_sleeps, tx->pace_skips);
+    }
     rc = 0;
 out:
+    if (tx->stripe != NULL) {
+        free(tx->stripe->pkt);
+        free(tx->stripe);
+        tx->stripe = NULL;
+    }
     tx->outq = NULL;
     if (send_started) {
         pthread_mutex_lock(&sq.mu);
@@ -3209,7 +3682,7 @@ out:
         pthread_cond_destroy(&q.space_cv);
         pthread_mutex_destroy(&q.mu);
     }
-    free_flushed(maps, nmaps);
+    free_flushed(&flush);
     held_free(held, nheld);
     return rc;
 }
@@ -3377,6 +3850,19 @@ static void tally_gen_ranks(const GenBuf *g, uint32_t n_batches, int hist[BATS_M
     }
 }
 
+static void dest_note_fail(uint32_t gen, int ok, int bp, int inact, size_t symbols)
+{
+    static int shown;
+
+    if (shown >= 8) {
+        return;
+    }
+    shown++;
+    fprintf(stderr,
+            "bats-line: role=dest api=bats_decode gen=%u ok=%d bp=%d inact=%d symbols=%zu\n",
+            gen, ok, bp, inact, symbols);
+}
+
 static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32_t file_size,
                       uint64_t *dense, uint64_t *symbols, int *bp_sum, int *inact_sum,
                       int *rank_hist, uint32_t n_batches)
@@ -3400,8 +3886,12 @@ static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32
     coded_k = precode_k(K);
     coded_bytes = (size_t)coded_k * (size_t)T;
     if (line_copy) {
+        uint8_t *got = calloc((size_t)K, 1);
+
         dst = calloc(1, gen_bytes == 0 ? 1 : gen_bytes);
-        if (dst == NULL) {
+        if (dst == NULL || got == NULL) {
+            free(got);
+            free(dst);
             fprintf(stderr, "bats-line: 内存不足\n");
             return -1;
         }
@@ -3415,7 +3905,17 @@ static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32
             if (line_add1) {
                 payload_sub1(dst + (size_t)pno * (size_t)T, (size_t)T);
             }
+            got[pno] = 1;
         }
+        for (i = 0; i < (size_t)K; i++) {
+            if (!got[i]) {
+                free(got);
+                free(dst);
+                dest_note_fail(g->gen_id, 0, 0, 0, g->n);
+                return -1;
+            }
+        }
+        free(got);
         off = (size_t)g->gen_id * gen_bytes;
         chunk = gen_bytes;
         if (off >= file_size) {
@@ -3451,10 +3951,7 @@ static int decode_gen(GenBuf *g, int K, int T, uint64_t seed, int out_fd, uint32
     ok = bats_decode(syms, (int)g->n, coded_k, T, seed, dst, &bp, &inact);
     free(syms);
     if (ok != 1 || bp + inact != coded_k || !precode_matches(dst, K, T, seed)) {
-        fprintf(stderr,
-                "bats-line: role=dest api=bats_decode gen=%u ok=%d bp=%d "
-                "inact=%d symbols=%zu\n",
-                g->gen_id, ok, bp, inact, g->n);
+        dest_note_fail(g->gen_id, ok, bp, inact, g->n);
         free(dst);
         return -1;
     }
@@ -3550,18 +4047,18 @@ static void *dest_worker(void *arg)
             }
         }
         if (rc != 0) {
-            pool->failed = 1;
+            pool->bad_gens++;
         } else {
             pool->dense += dense;
             pool->symbols += symbols;
             pool->bp_sum += bp;
             pool->inact_sum += inact;
-            pool->n_done++;
-            if (flow != NULL) {
-                flow->n_done++;
-                if (flow->finished != NULL && gen_id < flow->n_gens) {
-                    flow->finished[gen_id] = 1;
-                }
+        }
+        pool->n_done++;
+        if (flow != NULL) {
+            flow->n_done++;
+            if (flow->finished != NULL && gen_id < flow->n_gens) {
+                flow->finished[gen_id] = 1;
             }
         }
         dest_unlink(pool, g);
@@ -3693,6 +4190,72 @@ static void dest_queue(DestPool *pool, GenBuf *g)
     pthread_cond_broadcast(&pool->cv);
 }
 
+/* 两台中继各可能把缺包 batch 多留一个 reorder-ms，目的端要盖住这两段。 */
+static uint64_t dest_reorder_ns(const DestPool *pool)
+{
+    if (pool->reorder_ms <= 0) {
+        return 0;
+    }
+    return (uint64_t)pool->reorder_ms * 2ull * 1000000ull;
+}
+static void dest_submit_older(DestPool *pool, uint16_t flow_id, uint32_t gen)
+{
+    GenBuf *g;
+    uint64_t now;
+    uint64_t need;
+
+    now = mono_ns();
+    need = dest_reorder_ns(pool);
+    for (g = pool->gens; g != NULL; g = g->next) {
+        if (!g->used || g->phase != GEN_FILLING || g->flow_id != flow_id || g->gen_id >= gen) {
+            continue;
+        }
+        if (pool->reorder_ms <= 0) {
+            if (gen >= 2 && g->gen_id + 1 < gen) {
+                dest_queue(pool, g);
+            }
+            continue;
+        }
+        if (since_ns(now, g->last_ns) >= need) {
+            dest_queue(pool, g);
+        }
+    }
+    if (pool->reorder_ms <= 0) {
+        return;
+    }
+    for (;;) {
+        GenBuf *oldest = NULL;
+        int pending = 0;
+
+        for (g = pool->gens; g != NULL; g = g->next) {
+            if (!g->used || g->phase != GEN_FILLING || g->flow_id != flow_id || g->gen_id >= gen) {
+                continue;
+            }
+            pending++;
+            if (oldest == NULL || g->gen_id < oldest->gen_id) {
+                oldest = g;
+            }
+        }
+        if (pending <= DEST_INFLIGHT_CAP || oldest == NULL) {
+            return;
+        }
+        dest_queue(pool, oldest);
+    }
+}
+
+static void dest_submit_quiet(DestPool *pool)
+{
+    int i;
+
+    for (i = 0; i < pool->n_flows; i++) {
+        DestFlow *f = &pool->flows[i];
+
+        if (f->used && f->have_high) {
+            dest_submit_older(pool, f->flow_id, f->high_gen);
+        }
+    }
+}
+
 static void dest_submit(DestPool *pool, int give_up)
 {
     GenBuf *g;
@@ -3737,6 +4300,8 @@ static int dest_wait_ms(const DestPool *pool, int idle_sec)
     uint64_t idle_ms = idle_deadline_ms(idle_sec, ended);
     int wait = 200;
     const GenBuf *g;
+    uint64_t now = mono_ns();
+    uint64_t need = dest_reorder_ns(pool);
 
     if (dest_inflight(pool)) {
         return 1;
@@ -3750,6 +4315,19 @@ static int dest_wait_ms(const DestPool *pool, int idle_sec)
         f = &pool->flows[g->flow_i];
         if (f->n_batches > 0 && g->n >= (size_t)f->n_batches * (size_t)BATS_M) {
             return 1;
+        }
+        if (need > 0 && f->have_high && g->gen_id < f->high_gen) {
+            uint64_t age = since_ns(now, g->last_ns);
+
+            if (age >= need) {
+                return 1;
+            }
+            if ((need - age) / 1000000ull < (uint64_t)wait) {
+                wait = (int)((need - age) / 1000000ull);
+                if (wait < 1) {
+                    wait = 1;
+                }
+            }
         }
     }
     if (idle_sec > 0) {
@@ -3825,6 +4403,11 @@ static int dest_on_packet(DestPool *pool, const uint8_t *buf, size_t n, int K, i
         return -1;
     }
     gen = get_u32(buf + 8);
+    if (!flow->have_high || gen > flow->high_gen) {
+        dest_submit_older(pool, flow_id, gen);
+        flow->high_gen = gen;
+        flow->have_high = 1;
+    }
     if (flow->finished != NULL && gen < flow->n_gens && flow->finished[gen]) {
         flow->data_pkts++;
         pthread_mutex_unlock(&pool->mu);
@@ -3957,6 +4540,23 @@ static int fit_write(DestPool *pool, int K)
     return 0;
 }
 
+static void raise_nofile(int need)
+{
+    struct rlimit rl;
+
+    if (need < 1 || getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        return;
+    }
+    if (rl.rlim_cur >= (rlim_t)need) {
+        return;
+    }
+    if ((rlim_t)need > rl.rlim_max) {
+        need = (int)rl.rlim_max;
+    }
+    rl.rlim_cur = (rlim_t)need;
+    (void)setrlimit(RLIMIT_NOFILE, &rl);
+}
+
 static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int reorder_ms,
                     int idle_sec, int expect_flows, int worker_arg)
 {
@@ -3975,8 +4575,9 @@ static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int r
     pthread_condattr_t attr;
     uint8_t *slotbuf = NULL;
 
-    (void)reorder_ms;
+    raise_nofile((expect_flows > 0 ? expect_flows : 1) + 128);
     memset(&pool, 0, sizeof(pool));
+    pool.reorder_ms = reorder_ms;
     pool.fit_psi = line_fit_psi;
     memset(&q, 0, sizeof(q));
     q.core = -1;
@@ -4108,6 +4709,7 @@ static int run_dest(int fd, const char *path, int K, int T, uint64_t seed, int r
             int due = idle_sec > 0 && elapsed_ms >= idle_deadline_ms(idle_sec, ended);
 
             dest_submit(&pool, ended && elapsed_ms >= (uint64_t)idle_sec * 1000ull);
+            dest_submit_quiet(&pool);
             if (pool.failed) {
                 goto out;
             }
@@ -4179,24 +4781,39 @@ out:
     for (i = 0; i < started; i++) {
         pthread_join(workers[i], NULL);
     }
-    pthread_mutex_lock(&pool.mu);
-    if (rc == 0 && !pool.failed) {
-        uint32_t file_bytes = 0;
+    {
+        uint64_t rx_bytes = 0;
+        uint64_t first_rx = 0;
+        uint64_t wall_ns;
+        uint64_t file_bytes = 0;
         int fi;
+        int ok;
 
+        if (queue_inited) {
+            pthread_mutex_lock(&q.mu);
+            rx_bytes = q.rx_bytes;
+            first_rx = q.first_rx_ns;
+            pthread_mutex_unlock(&q.mu);
+        }
+        wall_ns = first_rx == 0 ? 0 : mono_ns() - first_rx;
+        pthread_mutex_lock(&pool.mu);
+        ok = rc == 0 && !pool.failed && pool.bad_gens == 0;
         for (fi = 0; fi < pool.n_flows; fi++) {
             file_bytes += pool.flows[fi].file_size;
         }
         fprintf(stderr,
-                "bats-line: role=dest api=bats_decode flows=%d gens_ok=%d file_bytes=%u "
-                "symbols=%" PRIu64 " dense_coeff_packets=%" PRIu64
-                " bp=%d inact=%d\n",
-                pool.n_flows, pool.n_done, file_bytes, pool.symbols, pool.dense, pool.bp_sum,
-                pool.inact_sum);
-    } else {
-        rc = 1;
+                "bats-line: role=dest api=bats_decode flows=%d gens_ok=%d ok=%d file_bytes=%" PRIu64
+                " symbols=%" PRIu64 " dense_coeff_packets=%" PRIu64
+                " bp=%d inact=%d bad_gens=%d elapsed_ms=%" PRIu64
+                " rx_bytes=%" PRIu64 " rx_mbps=%" PRIu64 " decoded_mbps=%" PRIu64 "\n",
+                pool.n_flows, pool.n_done, ok, file_bytes, pool.symbols, pool.dense, pool.bp_sum,
+                pool.inact_sum, pool.bad_gens, (uint64_t)(wall_ns / 1000000ull), rx_bytes,
+                mbps_of(rx_bytes, wall_ns), ok ? mbps_of(file_bytes, wall_ns) : 0);
+        if (!ok) {
+            rc = 1;
+        }
+        pthread_mutex_unlock(&pool.mu);
     }
-    pthread_mutex_unlock(&pool.mu);
     if (pool.fit_psi && fit_write(&pool, pool.K) != 0) {
         rc = 1;
     }
@@ -4247,6 +4864,8 @@ static void usage(void)
     fprintf(stderr,
             "用法: bats_line --role source|relay|dest [选项]\n"
             "  --next HOST:PORT     下一跳（source、relay）\n"
+            "  --next2 HOST:PORT    中继的第二目的。要和 --split-flow 一起用\n"
+            "  --split-flow N       flow_id >= N 的包发往 --next2，其余发往 --next\n"
             "  --listen PORT        监听端口（relay、dest）\n"
             "  --bind ADDR          绑定 IPv4，默认 0.0.0.0\n"
             "  --input PATH         源文件\n"
@@ -4262,7 +4881,8 @@ static void usage(void)
             "  --loss-percent N     发送 DATA 前丢包，0..100\n"
             "  --loss-seed N\n"
             "  --rate-mbps N        0 表示不限速\n"
-            "  --reorder-ms N       保留参数，收发不再用它决定缺包\n"
+            "  --reorder-ms N       看到更新的 generation 后，缺包的 batch 再留 N 毫秒\n"
+            "  --gso-off            每个 UDP 包单独送出，方便链路上的 tc 按包丢\n"
             "  --idle-sec N         空闲这么久仍缺包就 recode 或译码；一直等不到 END 也在这时失败\n"
             "  --copy               不调用 encode/recode/decode，载荷按符号 memcpy\n"
             "  --add1               和 --copy 一起用：encode 每字节加 1，decode 减 1，中继仍拷贝\n"
@@ -4277,20 +4897,23 @@ int main(int argc, char **argv)
     const char *input = NULL;
     const char *output = NULL;
     const char *next = NULL;
+    const char *next2 = NULL;
     uint32_t listen_port = 0;
     uint32_t K = 128;
     uint32_t T = 4096;
     uint32_t batches = 0;
     uint32_t loss_percent = 0;
     uint32_t rate_mbps = 0;
-    uint32_t reorder_ms = 20;
+    uint32_t reorder_ms = 10;
     uint32_t idle_sec = 15;
     uint32_t flow_id = 0;
+    uint32_t split_flow = 0;
     uint32_t n_flows = 1;
     uint32_t n_workers = 0;
     uint64_t seed = 0xB175ull;
     uint64_t recode_seed = 1;
     uint64_t loss_seed = 1;
+    int gso_off = 0;
     Tx tx;
     int fd;
     int i;
@@ -4312,6 +4935,14 @@ int main(int argc, char **argv)
             i++;
         } else if (strcmp(a, "--next") == 0 && val) {
             next = val;
+            i++;
+        } else if (strcmp(a, "--next2") == 0 && val) {
+            next2 = val;
+            i++;
+        } else if (strcmp(a, "--split-flow") == 0 && val) {
+            if (parse_u32(val, &split_flow) != 0 || split_flow < 1u || split_flow > 65535u) {
+                die("--split-flow 不合法");
+            }
             i++;
         } else if (strcmp(a, "--input") == 0 && val) {
             input = val;
@@ -4398,6 +5029,8 @@ int main(int argc, char **argv)
         } else if (strcmp(a, "--add1") == 0) {
             line_copy = 1;
             line_add1 = 1;
+        } else if (strcmp(a, "--gso-off") == 0) {
+            gso_off = 1;
         } else if (strcmp(a, "--help") == 0) {
             usage();
             return 0;
@@ -4426,10 +5059,16 @@ int main(int argc, char **argv)
         install_line_psi(line_psi_path);
     }
     memset(&tx, 0, sizeof(tx));
+    tx.gso_off = gso_off;
     tx.loss_percent = (int)loss_percent;
     tx.loss_state = loss_seed ? loss_seed : 1;
     tx.rate_mbps = (int)rate_mbps;
 
+    if (next2 != NULL || split_flow != 0) {
+        if (strcmp(role, "relay") != 0) {
+            die("--next2 和 --split-flow 只在中继上使用");
+        }
+    }
     if (strcmp(role, "source") == 0) {
         if (input == NULL || next == NULL) {
             die("source 需要 --input 和 --next");
@@ -4449,12 +5088,22 @@ int main(int argc, char **argv)
         if (parse_hostport(next, &tx.next) != 0) {
             die("--next 应为 IPv4:PORT");
         }
+        if ((next2 == NULL) != (split_flow == 0)) {
+            die("--next2 和 --split-flow 要一起给出");
+        }
+        if (next2 != NULL) {
+            if (parse_hostport(next2, &tx.next2) != 0) {
+                die("--next2 应为 IPv4:PORT");
+            }
+            tx.have_next2 = 1;
+            tx.split_flow = split_flow;
+        }
         fd = open_udp(bind_ip, (uint16_t)listen_port, 1);
         /* 发送用另一只套接字。同一只上阻塞 send 会占着套接字锁，收包线程读不到。 */
         tx.fd = open_udp(bind_ip, 0, bind_ip != NULL);
         fprintf(stderr,
-                "bats-line: role=relay recode_seed=%" PRIu64 " loss=%u%%\n",
-                recode_seed, loss_percent);
+                "bats-line: role=relay recode_seed=%" PRIu64 " loss=%u%% split_flow=%u\n",
+                recode_seed, loss_percent, tx.split_flow);
         return run_relay(fd, &tx, recode_seed, (int)reorder_ms, (int)idle_sec, (int)T,
                          (int)n_flows);
     }
