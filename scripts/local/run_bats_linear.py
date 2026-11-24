@@ -67,6 +67,8 @@ GSO_OFF = os.environ.get("BATS_GSO", "1") == "0"
 PSI = os.environ.get("BATS_PSI", "").strip()
 # 只在目的端：这一轮仍用装入的度数，跑完按秩分布把新度数写到这个路径。
 FIT = os.environ.get("BATS_FIT", "").strip()
+# 按代 NACK：基线 batch 照发，译不动再补。中继在下游网卡上收，再交回上一跳。
+NACK = os.environ.get("BATS_NACK", "0") == "1"
 RECORD = os.environ.get("BATS_RECORD", "0") == "1"
 SPLIT = int(os.environ.get("BATS_SPLIT", "0"))
 DEST2 = os.environ.get("BATS_DEST2", "").strip()
@@ -199,9 +201,11 @@ PY""",
     copy = " --copy" if COPY else ""
     gso = " --gso-off" if GSO_OFF else ""
     batches = f" --batches {BATCHES}" if BATCHES else ""
+    reorder_ms = 3 if NACK else 10
+    nack_flag = " --nack" if NACK else ""
     base = (
-        f"--k {K} --t {T} --seed 0xB175 --reorder-ms 10 --idle-sec {IDLE} "
-        f"--loss-percent {LOSS} --rate-mbps {RATE}{batches}{copy}{gso}"
+        f"--k {K} --t {T} --seed 0xB175 --reorder-ms {reorder_ms} --idle-sec {IDLE} "
+        f"--loss-percent {LOSS} --rate-mbps {RATE}{batches}{copy}{gso}{nack_flag}"
     )
     common = f"{base}{worker}"
     psi = f" --psi {PSI}" if PSI else ""
@@ -216,7 +220,8 @@ PY""",
     ssh(
         4,
         f"ulimit -n 8192; {SCALAR_PREFIX}nohup {REMOTE_BIN} --role dest --bind {BIND[4]} --listen {PORT[4]} "
-        f"--output {remote_out} {dest_common} --flows {dest_flows} >{logs[4]} 2>&1 &",
+        f"--output {remote_out} {dest_common} --flows {dest_flows}"
+        f"{' --prev 10.40.40.1:19131' if NACK else ''} >{logs[4]} 2>&1 &",
     )
     if not wait_log(4, logs[4], "bats-line: listening"):
         ssh(4, f"cat {logs[4]}", check=False)
@@ -235,7 +240,8 @@ PY""",
     ssh(
         3,
         f"ulimit -n 8192; {SCALAR_PREFIX}nohup {REMOTE_BIN} --role relay --bind {BIND[3]} --listen {PORT[3]} "
-        f"--next {NEXT[3]}{split_args} --recode-seed 22 --loss-seed 3 {hop} >{logs[3]} 2>&1 &",
+        f"--next {NEXT[3]}{split_args} --recode-seed 22 --loss-seed 3 {hop}"
+        f"{' --prev 10.30.30.1:19121 --nack-listen 10.40.40.1:19131' if NACK else ''} >{logs[3]} 2>&1 &",
     )
     if not wait_log(3, logs[3], "bats-line: listening"):
         ssh(3, f"cat {logs[3]}", check=False)
@@ -243,7 +249,8 @@ PY""",
     ssh(
         2,
         f"ulimit -n 8192; {SCALAR_PREFIX}nohup {REMOTE_BIN} --role relay --bind {BIND[2]} --listen {PORT[2]} "
-        f"--next {NEXT[2]} --recode-seed 11 --loss-seed 2 {hop} >{logs[2]} 2>&1 &",
+        f"--next {NEXT[2]} --recode-seed 11 --loss-seed 2 {hop}"
+        f"{' --prev 10.20.20.1:19010 --nack-listen 10.30.30.1:19121' if NACK else ''} >{logs[2]} 2>&1 &",
     )
     if not wait_log(2, logs[2], "bats-line: listening"):
         ssh(2, f"cat {logs[2]}", check=False)
@@ -253,16 +260,20 @@ PY""",
     if ONE_SOURCE:
         src_script = (
             f"ulimit -n 8192; {SCALAR_PREFIX}{REMOTE_BIN} --role source --bind 10.20.20.1 --flow-id 0 --flows {FLOWS} "
+            f"{'--listen 19010 ' if NACK else ''}"
             f"--input {remote_in} --next {NEXT[1]} --loss-seed 1 "
             f"{src_common} >/tmp/bats_line_source.0.log 2>&1\n"
             "cat /tmp/bats_line_source.0.log > /tmp/bats_line_source.log\n"
         )
     else:
+        if NACK and FLOWS != 1:
+            raise SystemExit("NACK 这一版只跑一条流")
         src_script = "fail=0\npids=\n"
         for flow in range(FLOWS):
             remote_flow_in = remote_in if flow == 0 else f"{remote_in}.{flow}"
             src_script += (
                 f"{SCALAR_PREFIX}{REMOTE_BIN} --role source --bind 10.20.20.1 --flow-id {flow} "
+                f"{'--listen 19010 ' if NACK else ''}"
                 f"--input {remote_flow_in} --next {NEXT[1]} --loss-seed {flow + 1} "
                 f"{src_common} >/tmp/bats_line_source.{flow}.log 2>&1 &\n"
                 "pids=\"$pids $!\"\n"
